@@ -57,7 +57,7 @@ param
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.0.0'
+$script:PackagerVersion = '1.0.1'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -365,7 +365,7 @@ function Test-PackageDefinition
         $probe = if ("$src".EndsWith('\*')) { "$src".Substring(0, "$src".Length - 2) } else { "$src" }
         if (-not (Test-Path -LiteralPath $probe)) { $problems += "Source not found: $src" }
     }
-    return $problems
+    return ,@($problems)
 }
 
 #endregion
@@ -1393,9 +1393,10 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA')
 {
     # WPF needs an STA thread; relaunch this script in one.
     $exe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
-    $args = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
-    if ($Definition) { $args += @('-Definition', $Definition) }
-    Start-Process -FilePath $exe -ArgumentList $args
+    # Quoted: the script or definition path may contain spaces (Documents, OneDrive, ...).
+    $relaunchArgs = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+    if ($Definition) { $relaunchArgs += @('-Definition', ('"{0}"' -f (Resolve-Path -LiteralPath $Definition).Path)) }
+    Start-Process -FilePath $exe -ArgumentList $relaunchArgs
     return
 }
 
@@ -1782,8 +1783,11 @@ function Select-FileDialog
     $d.Filter = $Filter
     $d.Multiselect = [bool]$Multi
     if ($InitialDirectory -and (Test-Path -LiteralPath $InitialDirectory)) { $d.InitialDirectory = $InitialDirectory }
-    if ($d.ShowDialog($script:Window) -eq $true) { return @($d.FileNames) }
-    return @()
+    # The leading comma is required: PowerShell unrolls a returned collection, so a single
+    # selected file would come back as a bare string and $result[0] would be its first
+    # character ('C' from 'C:\...'). Do not remove it.
+    if ($d.ShowDialog($script:Window) -eq $true) { return ,@($d.FileNames) }
+    return ,@()
 }
 
 function Select-SaveDialog
