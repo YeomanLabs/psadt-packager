@@ -1,0 +1,69 @@
+{
+  "SchemaVersion": 1,
+  "App": {
+    "Vendor": "Notepad++ Team",
+    "Name": "Notepad++",
+    "Version": "8.8.1",
+    "Arch": "x64",
+    "Lang": "EN",
+    "Revision": "01",
+    "ScriptVersion": "1.0.0",
+    "Author": "Andrew Yeoman"
+  },
+  "Sources": {
+    "Files": [
+      "C:\\Sources\\Notepad++\\8.8.1\\npp.8.8.1.Installer.x64.exe"
+    ],
+    "SupportFiles": [
+      "C:\\Sources\\Notepad++\\config\\*"
+    ]
+  },
+  "Install": {
+    "Type": "EXE",
+    "File": "npp.8.8.1.Installer.x64.exe",
+    "Arguments": "/S",
+    "Transforms": [],
+    "ProductCode": "",
+    "ProcessesToClose": [ "notepad++|Notepad++" ],
+    "SuccessExitCodes": [ 0 ],
+    "RebootExitCodes": [ 1641, 3010 ],
+    "ShowWelcome": true,
+    "AllowDefer": true,
+    "DeferTimes": 3,
+    "ShowProgress": true,
+    "ShowCompletionPrompt": false,
+    "PreScript": "",
+    "CustomScript": "",
+    "PostScript": "## Disable the auto-updater for all users.\nRemove-ADTFolder -Path \"$env:ProgramFiles\\Notepad++\\updater\"\nCopy-ADTFile -Path \"$($adtSession.DirSupportFiles)\\*\" -Destination \"$env:ProgramFiles\\Notepad++\" -Recurse"
+  },
+  "Uninstall": {
+    "Type": "Name",
+    "ProductCode": "",
+    "Name": "Notepad++*",
+    "NameIsRegex": false,
+    "ApplicationType": "EXE",
+    "File": "",
+    "Arguments": "/S",
+    "PackageName": "",
+    "PreScript": "",
+    "CustomScript": "",
+    "PostScript": ""
+  },
+  "Detection": {
+    "Type": "Registry",
+    "ProductCode": "",
+    "MinVersion": "8.8.1",
+    "DisplayName": "Notepad++*",
+    "MatchMode": "Wildcard",
+    "FilePath": "",
+    "CheckFileVersion": true,
+    "PackageName": "",
+    "Script": ""
+  },
+  "Output": {
+    "Destination": "C:\\Packages",
+    "DeployMode": "Silent",
+    "BuildIntuneWin": true,
+    "IntuneWinAppUtil": ""
+  }
+}

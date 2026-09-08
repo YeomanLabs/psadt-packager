@@ -1,0 +1,67 @@
+{
+  "SchemaVersion": 1,
+  "App": {
+    "Vendor": "GitHub",
+    "Name": "GitHub CLI",
+    "Version": "2.100.0",
+    "Arch": "x64",
+    "Lang": "EN",
+    "Revision": "01",
+    "ScriptVersion": "1.0.0",
+    "Author": "Andrew Yeoman"
+  },
+  "Sources": {
+    "Files": [
+      "C:\\Sources\\GitHub CLI\\2.100.0\\gh_2.100.0_windows_amd64.msi"
+    ],
+    "SupportFiles": []
+  },
+  "Install": {
+    "Type": "MSI",
+    "File": "gh_2.100.0_windows_amd64.msi",
+    "Arguments": "ALLUSERS=1",
+    "Transforms": [],
+    "ProductCode": "{67E6AC7F-85BD-4139-B4F8-69B62D830678}",
+    "ProcessesToClose": [ "gh" ],
+    "SuccessExitCodes": [ 0 ],
+    "RebootExitCodes": [ 1641, 3010 ],
+    "ShowWelcome": true,
+    "AllowDefer": true,
+    "DeferTimes": 3,
+    "ShowProgress": true,
+    "ShowCompletionPrompt": false,
+    "PreScript": "",
+    "CustomScript": "",
+    "PostScript": ""
+  },
+  "Uninstall": {
+    "Type": "MSI",
+    "ProductCode": "{67E6AC7F-85BD-4139-B4F8-69B62D830678}",
+    "Name": "",
+    "NameIsRegex": false,
+    "ApplicationType": "All",
+    "File": "",
+    "Arguments": "",
+    "PackageName": "",
+    "PreScript": "",
+    "CustomScript": "",
+    "PostScript": ""
+  },
+  "Detection": {
+    "Type": "MSI",
+    "ProductCode": "{67E6AC7F-85BD-4139-B4F8-69B62D830678}",
+    "MinVersion": "2.100.0",
+    "DisplayName": "",
+    "MatchMode": "Wildcard",
+    "FilePath": "",
+    "CheckFileVersion": true,
+    "PackageName": "",
+    "Script": ""
+  },
+  "Output": {
+    "Destination": "C:\\Packages",
+    "DeployMode": "Silent",
+    "BuildIntuneWin": true,
+    "IntuneWinAppUtil": ""
+  }
+}
