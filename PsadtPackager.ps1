@@ -31,6 +31,16 @@
 .PARAMETER Force
     Overwrite an existing Package folder in headless mode.
 
+.PARAMETER Publish
+    After building, sign in to Microsoft Graph (device code) and create the Intune Win32 app,
+    uploading the .intunewin and filling in every setting the definition already knows.
+
+.PARAMETER TenantId
+    Tenant id or domain for the Graph sign-in. Defaults to the definition, then to 'organizations'.
+
+.PARAMETER ClientId
+    App registration to sign in with. Defaults to the Microsoft Graph PowerShell public client.
+
 .EXAMPLE
     .\PsadtPackager.ps1
 
@@ -51,7 +61,13 @@ param
 
     [string]$Destination,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [switch]$Publish,
+
+    [string]$TenantId,
+
+    [string]$ClientId
 )
 
 Set-StrictMode -Off
@@ -74,6 +90,19 @@ $script:MatchModeCodes     = @('Exact', 'Wildcard', 'Regex')
 $script:AppTypeCodes       = @('All', 'MSI', 'EXE')
 $script:ArchChoices        = @('', 'x64', 'x86', 'ARM64')
 $script:DeployModeChoices  = @('Silent', 'Auto', 'Interactive', 'NonInteractive')
+$script:RunAsChoices       = @('system', 'user')
+$script:RunAsLabels        = @('System (device context)', 'User (logged-on user)')
+$script:RestartChoices     = @('basedOnReturnCode', 'allow', 'suppress', 'force')
+$script:RestartLabels      = @('Determine behavior based on return codes', 'App install may force a device restart', 'No specific action', 'Intune will force a mandatory device restart')
+$script:MinOsCodes         = @('v10_1607', 'v10_1703', 'v10_1709', 'v10_1803', 'v10_1809', 'v10_1903', 'v10_1909', 'v10_2004', 'v10_2H20', 'v10_21H1')
+$script:MinOsLabels        = @('Windows 10 1607', 'Windows 10 1703', 'Windows 10 1709', 'Windows 10 1803', 'Windows 10 1809', 'Windows 10 1903', 'Windows 10 1909', 'Windows 10 2004', 'Windows 10 20H2', 'Windows 10 21H1 or later')
+$script:ArchChoicesIntune  = @('', 'x64', 'x86,x64', 'x86', 'arm64')
+# Tried in the sandbox, after the current arguments and the detected engine's preset. Order = most common first.
+$script:GenericSilentCandidates = @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-', '/quiet /norestart', '/silent', '/s', '/qn /norestart', '-silent', '--silent', '/q', '-q', '/s /v"/qn REBOOT=ReallySuppress"', '/exenoui /qn', '/passive /norestart', '-y', '--mode unattended')
+# Tokens looked for as literal strings inside an EXE; a hit promotes the matching candidate.
+$script:SwitchVocabulary = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/SILENT', '/NORESTART', '/quiet', '/passive', '/norestart', '/qn', '/exenoui', '--silent', '-silent', '/silent', '--quiet', '--mode', 'unattended', '/unattended', '/S', '/s', '-q', '-y', '/q', '-i silent', '--confirm-command', '--accept-licenses', '-overwrite')
+$script:GraphToken         = $null
+$script:GraphPromptSink    = $null
 
 $script:SilentPresets = [ordered]@{
     'Inno'              = @{ Label = 'Inno Setup';             Install = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'; Uninstall = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
@@ -84,6 +113,14 @@ $script:SilentPresets = [ordered]@{
     'InstallAware'      = @{ Label = 'InstallAware';           Install = '/s';                                            Uninstall = '/s MODIFY=FALSE REMOVE=TRUE UNINSTALL=YES' }
     'AdvancedInstaller' = @{ Label = 'Advanced Installer';     Install = '/exenoui /qn';                                  Uninstall = '/x /qn' }
     'MsiWrapper'        = @{ Label = 'msiexec-style wrapper';  Install = '/qn /norestart';                                Uninstall = '/qn /norestart' }
+    'Install4j'         = @{ Label = 'install4j';              Install = '-q -overwrite';                                 Uninstall = '-q' }
+    'InstallBuilder'    = @{ Label = 'BitRock / InstallBuilder'; Install = '--mode unattended --unattendedmodeui none';   Uninstall = '--mode unattended' }
+    'InstallAnywhere'   = @{ Label = 'InstallAnywhere';        Install = '-i silent';                                     Uninstall = '-i silent' }
+    'QtIfw'             = @{ Label = 'Qt Installer Framework'; Install = 'install --accept-licenses --confirm-command --default-answer'; Uninstall = 'purge --confirm-command' }
+    'Wise'              = @{ Label = 'Wise Installer';         Install = '/s';                                            Uninstall = '/s' }
+    'SetupFactory'      = @{ Label = 'Setup Factory';          Install = '/S';                                            Uninstall = '/S' }
+    'SevenZipSfx'       = @{ Label = '7-Zip self-extractor';   Install = '-y';                                            Uninstall = '' }
+    'WinRarSfx'         = @{ Label = 'WinRAR self-extractor';  Install = '/S';                                            Uninstall = '' }
     'Unknown'           = @{ Label = 'Unknown / enter manually'; Install = '';                                            Uninstall = '' }
 }
 
@@ -272,6 +309,27 @@ function New-PackageDefinition
             BuildIntuneWin  = $false
             IntuneWinAppUtil= ''
         }
+        Intune = [pscustomobject]@{
+            TenantId                = ''
+            ClientId                = ''
+            DisplayName             = ''   # blank = "<Name> <Version>"
+            Description             = ''   # blank = auto
+            Publisher               = ''   # blank = App.Vendor
+            Developer               = ''
+            Owner                   = ''
+            Notes                   = ''
+            InformationUrl          = ''
+            PrivacyUrl              = ''
+            InstallCommand          = ''   # blank = derived from Output.DeployMode
+            UninstallCommand        = ''
+            RunAsAccount            = 'system'
+            RestartBehavior         = 'basedOnReturnCode'
+            MaxRunTimeInMinutes     = 60
+            MinimumOs               = 'v10_1809'
+            Architecture            = ''   # blank = derived from App.Arch
+            AllowAvailableUninstall = $true
+            PublishAfterBuild       = $false
+        }
     }
 }
 
@@ -426,7 +484,63 @@ function Get-InstallerEngine
     if ($latin -match 'InstallAware' -or $wide -match 'InstallAware')                               { return 'InstallAware' }
     if ($latin -match 'Advanced Installer' -or $wide -match 'Advanced Installer' -or $meta -match 'Advanced Installer') { return 'AdvancedInstaller' }
     if ($latin -match 'MSI Wrapper' -or $wide -match 'MSI Wrapper' -or $wide -match 'msiexec')      { return 'MsiWrapper' }
+    if ($latin -match 'install4j' -or $wide -match 'install4j' -or $meta -match 'install4j')         { return 'Install4j' }
+    if ($latin -match 'BitRock' -or $wide -match 'BitRock' -or $latin -match 'InstallBuilder' -or $wide -match 'InstallBuilder') { return 'InstallBuilder' }
+    if ($latin -match 'InstallAnywhere' -or $wide -match 'InstallAnywhere')                         { return 'InstallAnywhere' }
+    if ($latin -match 'Qt Installer Framework' -or $wide -match 'Qt Installer Framework' -or $latin -match 'QtInstallerFramework') { return 'QtIfw' }
+    if ($latin -match 'Wise Installation' -or $wide -match 'Wise Installation' -or $meta -match 'Wise') { return 'Wise' }
+    if ($latin -match 'Setup Factory' -or $wide -match 'Setup Factory' -or $meta -match 'Setup Factory') { return 'SetupFactory' }
+    if ($latin -match '!@Install@!' -or $latin -match '7-Zip SFX' -or $wide -match '7-Zip SFX' -or $meta -match '7-Zip')    { return 'SevenZipSfx' }
+    if ($latin -match 'WinRAR SFX' -or $wide -match 'WinRAR SFX' -or $meta -match 'WinRAR')          { return 'WinRarSfx' }
     return 'Unknown'
+}
+
+function Find-InstallerSwitchStrings
+{
+    # Which known silent switches appear verbatim inside the binary (ANSI or UTF-16). Evidence for ranking, not proof.
+    param([Parameter(Mandatory)][string]$Path)
+    $fs = [System.IO.File]::OpenRead($Path)
+    try
+    {
+        $len = [int][Math]::Min($fs.Length, 8MB)
+        $buf = New-Object byte[] $len
+        [void]$fs.Read($buf, 0, $len)
+    }
+    finally { $fs.Dispose() }
+    # ANSI view plus UTF-16 at both byte alignments; nulls stay in place so adjacent strings don't merge.
+    $views = @(
+        [System.Text.Encoding]::GetEncoding(28591).GetString($buf),
+        [System.Text.Encoding]::Unicode.GetString($buf),
+        [System.Text.Encoding]::Unicode.GetString($buf, 1, $len - 1)
+    )
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($tok in $script:SwitchVocabulary)
+    {
+        # ASCII-only boundaries: .NET's \w matches Unicode letters, which random UTF-16 code units often are.
+        $pattern = '(?<![A-Za-z0-9_/\-])' + [regex]::Escape($tok) + '(?![A-Za-z0-9_\-])'
+        foreach ($v in $views) { if ($v -cmatch $pattern) { $found.Add($tok); break } }
+    }
+    return $found.ToArray()
+}
+
+function Get-SilentCandidates
+{
+    # Ordered, case-sensitive-unique list of argument strings to try for an EXE.
+    param([Parameter(Mandatory)][string]$Path, [string]$Engine, [string]$CurrentArgs, [int]$Max = 4)
+    $list = New-Object System.Collections.Generic.List[string]
+    $add  = New-Object System.Collections.Generic.List[string]
+    if ("$CurrentArgs".Trim()) { $add.Add("$CurrentArgs".Trim()) }
+    if ($Engine -and $script:SilentPresets.Contains($Engine) -and $script:SilentPresets[$Engine].Install) { $add.Add($script:SilentPresets[$Engine].Install) }
+    $strings = @(Find-InstallerSwitchStrings -Path $Path)
+    foreach ($c in $script:GenericSilentCandidates)
+    {
+        $first = ($c -split '\s+')[0]
+        if ($strings -ccontains $first) { $add.Add($c) }
+    }
+    foreach ($c in $script:GenericSilentCandidates) { $add.Add($c) }
+    foreach ($c in $add) { if (-not $list.Contains($c)) { $list.Add($c) } }
+    if ($list.Count -gt $Max) { $list.RemoveRange($Max, $list.Count - $Max) }
+    return $list.ToArray()
 }
 
 function Get-AppxManifestInfo
@@ -1115,9 +1229,15 @@ function New-PackageReadme
     param([Parameter(Mandatory)]$Def, [string]$FolderName, [string]$DetectFileName, [string]$ToolkitVersion, [string]$IntuneWinName)
     $a = $Def.App
     $mode = if ($script:DeployModeChoices -contains $Def.Output.DeployMode) { $Def.Output.DeployMode } else { 'Silent' }
-    $modeArg = if ($mode -eq 'Auto') { '' } else { " -DeployMode $mode" }
-    $success = @($Def.Install.SuccessExitCodes | Where-Object { "$_" -match '^\d+$' })
-    $reboot  = @($Def.Install.RebootExitCodes  | Where-Object { "$_" -match '^\d+$' })
+    $installCmd   = Get-IntuneInstallCommand -Def $Def
+    $uninstallCmd = Get-IntuneUninstallCommand -Def $Def
+    $rcText = ((Get-IntuneReturnCodes -Def $Def) | ForEach-Object { "$($_.returnCode) = $($_.type)" }) -join '; '
+    $minOsIdx = [Array]::IndexOf($script:MinOsCodes, "$($Def.Intune.MinimumOs)")
+    $minOsText = if ($minOsIdx -ge 0) { $script:MinOsLabels[$minOsIdx] } else { 'Windows 10 1809' }
+    $runAsIdx = [Array]::IndexOf($script:RunAsChoices, "$($Def.Intune.RunAsAccount)")
+    $runAsText = if ($runAsIdx -ge 0) { $script:RunAsLabels[$runAsIdx] } else { 'System (device context)' }
+    $restartIdx = [Array]::IndexOf($script:RestartChoices, "$($Def.Intune.RestartBehavior)")
+    $restartText = if ($restartIdx -ge 0) { $script:RestartLabels[$restartIdx] } else { 'Determine behavior based on return codes' }
     $L = New-Object System.Collections.Generic.List[string]
     $L.Add("# $($a.Vendor) $($a.Name) $($a.Version)".Replace('#  ', '# ').TrimEnd())
     $L.Add('')
@@ -1127,15 +1247,23 @@ function New-PackageReadme
     $L.Add('')
     $L.Add('| Setting | Value |')
     $L.Add('| --- | --- |')
+    $L.Add("| Name | $(Get-IntuneDisplayName -Def $Def) |")
+    $L.Add("| Publisher | $(if ("$($Def.Intune.Publisher)".Trim()) { "$($Def.Intune.Publisher)".Trim() } else { "$($a.Vendor)".Trim() }) |")
+    $L.Add("| App version | $("$($a.Version)".Trim()) |")
     $L.Add('| Package source folder (`.intunewin` content) | `Package\` |')
     $L.Add('| Setup file (IntuneWinAppUtil `-s`) | `Invoke-AppDeployToolkit.exe` |')
-    $L.Add("| Install command | ``Invoke-AppDeployToolkit.exe -DeploymentType Install$modeArg`` |")
-    $L.Add("| Uninstall command | ``Invoke-AppDeployToolkit.exe -DeploymentType Uninstall$modeArg`` |")
-    $L.Add('| Install behavior | System |')
-    $L.Add('| Device restart behavior | Determine behavior based on return codes |')
+    $L.Add("| Install command | ``$installCmd`` |")
+    $L.Add("| Uninstall command | ``$uninstallCmd`` |")
+    $L.Add("| Install behavior | $runAsText |")
+    $L.Add("| Device restart behavior | $restartText |")
+    $L.Add("| Minimum operating system | $minOsText |")
+    $L.Add("| Applicable architectures | $(Get-IntuneArchitectures -Def $Def) |")
+    $L.Add("| Allow uninstall (Available assignments) | $(if ($Def.Intune.AllowAvailableUninstall) { 'Yes' } else { 'No' }) |")
     $L.Add("| Detection rule | Use a custom detection script: ``$DetectFileName`` (Run as 32-bit: No, Enforce signature check: No) |")
-    $L.Add("| Return codes | Success: $($success -join ', '); Soft reboot: $($reboot -join ', '); Retry: 1618; PSADT: 60012 = deferred by user (map to Failed or Retry), 1602 = cancelled |")
+    $L.Add("| Return codes | $rcText |")
     if ($IntuneWinName) { $L.Add("| Built package | ``Intune\$IntuneWinName`` |") }
+    $L.Add('')
+    $L.Add('Publish these settings straight from the Intune tab (or `-Publish`) instead of retyping them.')
     $L.Add('')
     $L.Add('`-DeployMode Silent` never shows dialogs (Required assignments). `Auto` (toolkit default) shows the welcome/progress dialogs when a user is logged on and suppresses them otherwise; use it for Available assignments where you want close-app prompts and deferrals.')
     $L.Add('')
@@ -1263,12 +1391,13 @@ function Invoke-PackageBuild
     $problems = Test-PackageDefinition -Def $Def
     if ($problems.Count -gt 0) { throw ("Definition is not complete:`n - " + ($problems -join "`n - ")) }
 
-    $folderName = Get-PackageFolderName -Def $Def
-    $root       = Join-Path $Def.Output.Destination $folderName
-    $pkg        = Join-Path $root 'Package'
-    $filesDir   = Join-Path $pkg 'Files'
-    $supportDir = Join-Path $pkg 'SupportFiles'
-    $detectName = "Detect-$(Get-SafeName $Def.App.Name).ps1"
+    $paths      = Get-PackagePaths -Def $Def
+    $folderName = $paths.FolderName
+    $root       = $paths.Root
+    $pkg        = $paths.Package
+    $filesDir   = $paths.FilesDir
+    $supportDir = $paths.SupportDir
+    $detectName = $paths.DetectName
 
     Write-PackagerLog "Building package '$folderName' in $root"
     if (Test-Path -LiteralPath $pkg)
@@ -1344,9 +1473,9 @@ function Invoke-PackageBuild
     {
         $tool = Resolve-IntuneWinAppUtil -Configured $Def.Output.IntuneWinAppUtil
         if (-not $tool) { throw 'IntuneWinAppUtil.exe was not found. Set its path on the Build tab or use the Download button.' }
-        $intuneDir = Join-Path $root 'Intune'
+        $intuneDir = $paths.IntuneDir
         if (-not (Test-Path -LiteralPath $intuneDir)) { New-Item -ItemType Directory -Path $intuneDir -Force | Out-Null }
-        $intuneWinName = "$folderName.intunewin"
+        $intuneWinName = $paths.IntuneWinName
         $rawOut = Join-Path $intuneDir 'Invoke-AppDeployToolkit.intunewin'
         $final  = Join-Path $intuneDir $intuneWinName
         foreach ($f in @($rawOut, $final)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
@@ -1355,13 +1484,1165 @@ function Invoke-PackageBuild
         foreach ($line in @($output)) { if ("$line".Trim()) { Write-PackagerLog "  $line" } }
         if (-not (Test-Path -LiteralPath $rawOut)) { throw "IntuneWinAppUtil did not produce $rawOut (exit code $LASTEXITCODE)." }
         Rename-Item -LiteralPath $rawOut -NewName $intuneWinName -Force
-        Write-PackagerLog "Created $final"
+        $portalName = Get-IntuneDisplayName -Def $Def
+        Set-IntuneWinDisplayName -Path $final -Name $portalName
+        Write-PackagerLog "Created $final (the Add App wizard will name it '$portalName')"
     }
 
     Write-Utf8File -Path (Join-Path $root 'README.md') -Content (New-PackageReadme -Def $Def -FolderName $folderName -DetectFileName $detectName -ToolkitVersion "$($mod.Version)" -IntuneWinName $intuneWinName)
+
+    # The exact Win32 app body, so the settings can be reviewed or posted to Graph without rebuilding.
+    $appPayload = New-IntuneAppPayload -Def $Def -DetectionScript ([System.IO.File]::ReadAllText((Join-Path $root $detectName))) -IntuneWinFileName $paths.IntuneWinName
+    Write-Utf8File -Path (Join-Path $root 'IntuneApp.json') -Content (ConvertTo-IntuneAppJson -Payload $appPayload)
+
     Write-PackagerLog "Done: $root"
     return $root
 }
+
+#endregion
+
+#region ---------------------------------------------------------------- Windows Sandbox probe: find silent switches by running the installer
+
+$script:SandboxProbeScript = @'
+# Run-Probe.ps1 - executed inside Windows Sandbox by PSADT Packager. Everything here is thrown away when the sandbox closes.
+# Reads C:\Probe\config.json, writes C:\Probe\result.json and C:\Probe\probe.log (C:\Probe is the host's run folder).
+$ErrorActionPreference = 'Continue'
+$probeDir  = 'C:\Probe'
+$srcDir    = 'C:\Installer'
+$workDir   = 'C:\Work'
+$logPath   = Join-Path $probeDir 'probe.log'
+$resultPath= Join-Path $probeDir 'result.json'
+
+function Write-ProbeLog([string]$Message)
+{
+    $line = '[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message
+    Add-Content -LiteralPath $logPath -Value $line
+    Write-Host $line
+}
+
+$result = [ordered]@{
+    Candidate        = ''
+    Started          = (Get-Date).ToString('s')
+    Help             = $null
+    Install          = $null
+    InstallSucceeded = $false
+    NewEntries       = @()
+    Detection        = $null
+    Uninstall        = $null
+    Error            = $null
+}
+
+try
+{
+    $cfg = Get-Content -LiteralPath (Join-Path $probeDir 'config.json') -Raw | ConvertFrom-Json
+    $result.Candidate = "$($cfg.Candidate)"
+    Write-ProbeLog "Probe started. Candidate: [$($cfg.Candidate)]"
+
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    Add-Type -TypeDefinition @"
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class ProbeWin
+{
+    public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    public static List<KeyValuePair<uint, long>> VisibleWindows()
+    {
+        var list = new List<KeyValuePair<uint, long>>();
+        EnumWindows((h, l) => { if (IsWindowVisible(h)) { uint pid; GetWindowThreadProcessId(h, out pid); list.Add(new KeyValuePair<uint, long>(pid, h.ToInt64())); } return true; }, IntPtr.Zero);
+        return list;
+    }
+    public static string Title(long hWnd)
+    {
+        IntPtr h = new IntPtr(hWnd);
+        int n = GetWindowTextLength(h);
+        var sb = new StringBuilder(n + 1);
+        GetWindowText(h, sb, sb.Capacity);
+        return sb.ToString();
+    }
+}
+"@
+
+    function Get-ProcessTree([int]$RootPid)
+    {
+        $all = @(Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId, ParentProcessId)
+        $ids = New-Object 'System.Collections.Generic.HashSet[int]'
+        [void]$ids.Add($RootPid)
+        do
+        {
+            $added = $false
+            foreach ($p in $all)
+            {
+                if ($ids.Contains([int]$p.ParentProcessId) -and -not $ids.Contains([int]$p.ProcessId)) { [void]$ids.Add([int]$p.ProcessId); $added = $true }
+            }
+        } while ($added)
+        return @($ids)
+    }
+
+    function Get-TreeWindows([int[]]$Pids)
+    {
+        $out = @()
+        foreach ($kv in [ProbeWin]::VisibleWindows())
+        {
+            if ($Pids -contains [int]$kv.Key)
+            {
+                $t = [ProbeWin]::Title($kv.Value)
+                if ($t) { $out += [pscustomobject]@{ Pid = [int]$kv.Key; Handle = [int64]$kv.Value; Title = $t } }
+            }
+        }
+        return $out
+    }
+
+    function Get-WindowText([int64]$Handle)
+    {
+        try
+        {
+            $el  = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Handle)
+            $all = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+            $parts = New-Object System.Collections.Generic.List[string]
+            foreach ($e in $all) { $n = "$($e.Current.Name)".Trim(); if ($n -and -not $parts.Contains($n)) { $parts.Add($n) } }
+            return ($parts -join "`n")
+        }
+        catch { return '' }
+    }
+
+    function Stop-ProcessTree([int]$RootPid)
+    {
+        foreach ($id in (Get-ProcessTree $RootPid)) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
+    }
+
+    function Invoke-Monitored
+    {
+        # Runs a command and watches its whole process tree for windows. A window that stays for longer than the grace
+        # period means the run is not silent; the tree is killed and that is reported.
+        param([string]$File, [string]$Arguments, [int]$TimeoutSec, [int]$UiGraceSec, [switch]$CaptureUi)
+        $stamp   = [guid]::NewGuid().ToString('N')
+        $outFile = Join-Path $env:TEMP "probe-$stamp.out"
+        $errFile = Join-Path $env:TEMP "probe-$stamp.err"
+        $params  = @{ FilePath = $File; PassThru = $true; WorkingDirectory = (Split-Path -Path $File -Parent); RedirectStandardOutput = $outFile; RedirectStandardError = $errFile }
+        if ("$Arguments".Trim()) { $params.ArgumentList = $Arguments }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try { $p = Start-Process @params }
+        catch { return [pscustomobject]@{ ExitCode = $null; DurationSec = 0; WindowTitles = @(); UiPersisted = $false; TimedOut = $false; StdOut = ''; StdErr = "Could not start: $($_.Exception.Message)"; UiText = ''; StartFailed = $true } }
+
+        $firstUi = $null; $titles = @{}; $uiText = ''; $timedOut = $false; $uiPersisted = $false
+        while (-not $p.HasExited)
+        {
+            Start-Sleep -Milliseconds 1000
+            $wins = Get-TreeWindows -Pids (Get-ProcessTree $p.Id)
+            if ($wins.Count -gt 0)
+            {
+                if (-not $firstUi) { $firstUi = Get-Date }
+                foreach ($w in $wins)
+                {
+                    $titles[$w.Title] = $true
+                    if ($CaptureUi) { $t = Get-WindowText $w.Handle; if ($t.Length -gt $uiText.Length) { $uiText = $t } }
+                }
+                if (((Get-Date) - $firstUi).TotalSeconds -ge $UiGraceSec) { $uiPersisted = $true; break }
+            }
+            else { $firstUi = $null }
+            if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; break }
+            $p.Refresh()
+        }
+        if (-not $p.HasExited) { Stop-ProcessTree $p.Id }
+        [void]$p.WaitForExit(5000)
+        $exit = $null
+        try { $exit = $p.ExitCode } catch { }
+        $so = ''; $se = ''
+        try { if (Test-Path $outFile) { $so = Get-Content -LiteralPath $outFile -Raw } } catch { }
+        try { if (Test-Path $errFile) { $se = Get-Content -LiteralPath $errFile -Raw } } catch { }
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{
+            ExitCode     = $exit
+            DurationSec  = [int]$sw.Elapsed.TotalSeconds
+            WindowTitles = @($titles.Keys)
+            UiPersisted  = $uiPersisted
+            TimedOut     = $timedOut
+            StdOut       = "$so".Trim()
+            StdErr       = "$se".Trim()
+            UiText       = $uiText
+            StartFailed  = $false
+        }
+    }
+
+    function Get-UninstallSnapshot
+    {
+        $roots = @(
+            @{ Hive = 'LocalMachine'; View = 'Registry64' },
+            @{ Hive = 'LocalMachine'; View = 'Registry32' },
+            @{ Hive = 'CurrentUser';  View = 'Default' }
+        )
+        $entries = @{}
+        foreach ($r in $roots)
+        {
+            try
+            {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]$r.Hive, [Microsoft.Win32.RegistryView]$r.View)
+                $key  = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+                if (-not $key) { continue }
+                foreach ($name in $key.GetSubKeyNames())
+                {
+                    $sub = $key.OpenSubKey($name)
+                    if (-not $sub) { continue }
+                    $id = "$($r.Hive)\$($r.View)\$name"
+                    $entries[$id] = [pscustomobject]@{
+                        Id                   = $id
+                        KeyName              = $name
+                        Location             = "$($r.Hive)\$($r.View)"
+                        DisplayName          = [string]$sub.GetValue('DisplayName')
+                        DisplayVersion       = [string]$sub.GetValue('DisplayVersion')
+                        Publisher            = [string]$sub.GetValue('Publisher')
+                        UninstallString      = [string]$sub.GetValue('UninstallString')
+                        QuietUninstallString = [string]$sub.GetValue('QuietUninstallString')
+                        InstallLocation      = [string]$sub.GetValue('InstallLocation')
+                        DisplayIcon          = [string]$sub.GetValue('DisplayIcon')
+                        SystemComponent      = [int]($sub.GetValue('SystemComponent', 0))
+                    }
+                    $sub.Close()
+                }
+                $key.Close()
+            }
+            catch { }
+        }
+        return $entries
+    }
+
+    function Split-CommandLine([string]$Command)
+    {
+        # "C:\path\unins000.exe" /SILENT   |   C:\path\uninstall.exe --silent   |   MsiExec.exe /X{GUID}
+        $c = "$Command".Trim()
+        if ($c -match '^"([^"]+)"\s*(.*)$') { return @{ File = $Matches[1]; Args = $Matches[2].Trim() } }
+        $m = [regex]::Match($c, '^(.+?\.exe)\s*(.*)$', 'IgnoreCase')
+        if ($m.Success) { return @{ File = $m.Groups[1].Value.Trim(); Args = $m.Groups[2].Value.Trim() } }
+        $parts = $c -split '\s+', 2
+        return @{ File = $parts[0]; Args = $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) }
+    }
+
+    # ---- Stage the installer on the sandbox's own disk (some installers write next to themselves).
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $srcDir '*') -Destination $workDir -Recurse -Force
+    $exe = Join-Path $workDir $cfg.InstallerName
+    if (-not (Test-Path -LiteralPath $exe)) { throw "Installer not found after copy: $exe" }
+    Write-ProbeLog "Installer: $exe"
+
+    $before = Get-UninstallSnapshot
+    Write-ProbeLog "Uninstall entries before: $($before.Count)"
+
+    # ---- Help probe: what does the installer say about itself?
+    if ($cfg.HelpSwitch)
+    {
+        Write-ProbeLog "Help probe: $($cfg.InstallerName) $($cfg.HelpSwitch)"
+        $h = Invoke-Monitored -File $exe -Arguments $cfg.HelpSwitch -TimeoutSec 25 -UiGraceSec 6 -CaptureUi
+        $text = (@($h.StdOut, $h.StdErr, $h.UiText) | Where-Object { $_ }) -join "`n"
+        $result.Help = [ordered]@{ Switch = "$($cfg.HelpSwitch)"; Text = $text; WindowTitles = @($h.WindowTitles); ExitCode = $h.ExitCode }
+        Write-ProbeLog "Help probe captured $($text.Length) chars, windows: $(@($h.WindowTitles) -join ' | ')"
+        # A help run must not leave anything behind; if it did, note it and carry on.
+        $afterHelp = Get-UninstallSnapshot
+        $leak = @($afterHelp.Keys | Where-Object { -not $before.ContainsKey($_) })
+        if ($leak.Count -gt 0) { Write-ProbeLog "Help switch appears to have installed something ($($leak.Count) new entries)"; $before = $afterHelp }
+    }
+
+    # ---- The candidate itself.
+    Write-ProbeLog "Install: $($cfg.InstallerName) $($cfg.Candidate)  (timeout $($cfg.TimeoutSec)s, UI grace $($cfg.UiGraceSec)s)"
+    $inst = Invoke-Monitored -File $exe -Arguments $cfg.Candidate -TimeoutSec $cfg.TimeoutSec -UiGraceSec $cfg.UiGraceSec
+    $result.Install = [ordered]@{
+        ExitCode = $inst.ExitCode; DurationSec = $inst.DurationSec; WindowTitles = @($inst.WindowTitles)
+        UiPersisted = $inst.UiPersisted; TimedOut = $inst.TimedOut; StdOut = $inst.StdOut; StdErr = $inst.StdErr; StartFailed = $inst.StartFailed
+    }
+    Write-ProbeLog "Install finished: exit $($inst.ExitCode), $($inst.DurationSec)s, UI persisted: $($inst.UiPersisted), timed out: $($inst.TimedOut)"
+    if ($inst.WindowTitles.Count -gt 0) { Write-ProbeLog "Windows seen: $(@($inst.WindowTitles) -join ' | ')" }
+
+    # Some installers hand off to a child and exit 0 immediately; give the registry a moment.
+    Start-Sleep -Seconds 5
+    $after = Get-UninstallSnapshot
+    $new = @($after.Keys | Where-Object { -not $before.ContainsKey($_) } | ForEach-Object { $after[$_] } | Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 })
+    $result.NewEntries = @($new | ForEach-Object { [ordered]@{
+        KeyName = $_.KeyName; Location = $_.Location; DisplayName = $_.DisplayName; DisplayVersion = $_.DisplayVersion; Publisher = $_.Publisher
+        UninstallString = $_.UninstallString; QuietUninstallString = $_.QuietUninstallString; InstallLocation = $_.InstallLocation
+    } })
+    Write-ProbeLog "New uninstall entries: $($new.Count)$(if ($new.Count) { ' - ' + (($new | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)" }) -join ' | ') })"
+
+    # ---- Detection script from the packager.
+    if ($cfg.DetectionScriptBase64)
+    {
+        $detPath = Join-Path $workDir 'Detect.ps1'
+        [System.IO.File]::WriteAllBytes($detPath, [Convert]::FromBase64String($cfg.DetectionScriptBase64))
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $detOut = & $psExe -NoProfile -ExecutionPolicy Bypass -File $detPath 2>&1
+        $result.Detection = [ordered]@{ ExitCode = $LASTEXITCODE; Output = (@($detOut) -join ' ').Trim() }
+        Write-ProbeLog "Detection script: exit $LASTEXITCODE $($result.Detection.Output)"
+    }
+
+    $silent = (-not $inst.UiPersisted) -and (-not $inst.TimedOut) -and (-not $inst.StartFailed)
+    $exitOk = $null -ne $inst.ExitCode -and (@($cfg.SuccessCodes) -contains [int]$inst.ExitCode)
+    $evidence = ($new.Count -gt 0) -or ($result.Detection -and $result.Detection.ExitCode -eq 0)
+    $result.InstallSucceeded = $silent -and $exitOk -and $evidence
+    Write-ProbeLog "Silent: $silent, exit OK: $exitOk, evidence of install: $evidence => succeeded: $($result.InstallSucceeded)"
+
+    # ---- Prove the uninstall too, while we have a machine with the app on it.
+    if ($result.InstallSucceeded -and $new.Count -gt 0)
+    {
+        $entry = @($new | Where-Object { $_.QuietUninstallString -or $_.UninstallString } | Select-Object -First 1)
+        if ($entry.Count -gt 0)
+        {
+            $entry = $entry[0]
+            $fromQuiet = [bool]$entry.QuietUninstallString
+            $cmd = if ($fromQuiet) { $entry.QuietUninstallString } else { $entry.UninstallString }
+            $parts = Split-CommandLine $cmd
+            $file = $parts.File; $uArgs = $parts.Args
+            if ($file -match '(?i)msiexec')
+            {
+                # Normalise to a silent MSI uninstall of the same product.
+                $uArgs = ($uArgs -replace '(?i)/I\{', '/X{')
+                if ($uArgs -notmatch '(?i)/q') { $uArgs = "$uArgs /qn /norestart".Trim() }
+            }
+            elseif (-not $fromQuiet -and "$($cfg.UninstallArgs)".Trim())
+            {
+                $uArgs = "$uArgs $($cfg.UninstallArgs)".Trim()
+            }
+            if ($file -notmatch '\\' -and $file -notmatch '(?i)msiexec') { $file = Join-Path $entry.InstallLocation $file }
+            Write-ProbeLog "Uninstall: `"$file`" $uArgs  (from $(if ($fromQuiet) { 'QuietUninstallString' } else { 'UninstallString' }))"
+            $un = Invoke-Monitored -File $file -Arguments $uArgs -TimeoutSec $cfg.TimeoutSec -UiGraceSec $cfg.UiGraceSec
+            Start-Sleep -Seconds 5
+            $final = Get-UninstallSnapshot
+            $gone = -not $final.ContainsKey($entry.Id)
+            $result.Uninstall = [ordered]@{
+                File = $file; Arguments = $uArgs; FromQuietUninstallString = $fromQuiet
+                ExitCode = $un.ExitCode; DurationSec = $un.DurationSec; UiPersisted = $un.UiPersisted; TimedOut = $un.TimedOut
+                WindowTitles = @($un.WindowTitles); EntryRemoved = $gone
+                Verified = ($gone -and -not $un.UiPersisted -and -not $un.TimedOut)
+            }
+            Write-ProbeLog "Uninstall finished: exit $($un.ExitCode), UI persisted: $($un.UiPersisted), entry removed: $gone"
+        }
+    }
+}
+catch
+{
+    $result.Error = $_.Exception.Message
+    Write-ProbeLog "ERROR: $($_.Exception.Message)"
+}
+finally
+{
+    $result.Finished = (Get-Date).ToString('s')
+    $json = $result | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText($resultPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-ProbeLog 'Result written; shutting the sandbox down.'
+    Start-Sleep -Seconds 3
+    Stop-Computer -Force
+}
+
+'@
+
+function Test-WindowsSandbox
+{
+    # Returns the path to WindowsSandbox.exe, or $null with a reason in the log.
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe'
+    if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+    Write-PackagerLog 'Windows Sandbox is not installed. Enable it with: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM (Pro/Enterprise/Education, virtualisation enabled).' -Level Warn
+    return $null
+}
+
+function New-SandboxConfigXml
+{
+    param([string]$InstallerDir, [string]$RunDir, [bool]$Network)
+    $esc = { param($t) [System.Security.SecurityElement]::Escape("$t") }
+    return @"
+<Configuration>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>$(& $esc $InstallerDir)</HostFolder>
+      <SandboxFolder>C:\Installer</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>$(& $esc $RunDir)</HostFolder>
+      <SandboxFolder>C:\Probe</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Probe\Run-Probe.ps1</Command>
+  </LogonCommand>
+  <Networking>$(if ($Network) { 'Default' } else { 'Disable' })</Networking>
+</Configuration>
+"@
+}
+
+function Invoke-SandboxProbe
+{
+    # Boots one sandbox per candidate, stops at the first one that installs silently. Returns every result collected.
+    param
+    (
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string[]]$Candidates,
+        [string]$DetectionScript,
+        [string]$UninstallArgs,
+        [int[]]$SuccessCodes = @(0, 3010, 1641),
+        [int]$TimeoutMinutes = 10,
+        [int]$UiGraceSeconds = 20,
+        [string]$HelpSwitch = '/?',
+        [bool]$Network = $true
+    )
+    $sandboxExe = Test-WindowsSandbox
+    if (-not $sandboxExe) { throw 'Windows Sandbox is not available on this PC.' }
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw "Installer not found: $InstallerPath" }
+    if (Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue) { throw 'A Windows Sandbox is already open. Close it first - only one can run at a time.' }
+
+    $runRoot = Join-Path $script:AppDataDir ('Sandbox\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+    Write-Utf8File -Path (Join-Path $runRoot 'Run-Probe.ps1') -Content $script:SandboxProbeScript
+    $wsbPath = Join-Path $runRoot 'probe.wsb'
+    Write-Utf8File -Path $wsbPath -Content (New-SandboxConfigXml -InstallerDir (Split-Path -Path $InstallerPath -Parent) -RunDir $runRoot -Network $Network)
+    Write-PackagerLog "Sandbox run folder: $runRoot"
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $n = 0
+    foreach ($candidate in $Candidates)
+    {
+        $n++
+        $resultPath = Join-Path $runRoot 'result.json'
+        $logPath    = Join-Path $runRoot 'probe.log'
+        foreach ($f in @($resultPath, $logPath)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+        $config = [ordered]@{
+            InstallerName        = Split-Path -Path $InstallerPath -Leaf
+            Candidate            = $candidate
+            HelpSwitch           = $(if ($n -eq 1) { $HelpSwitch } else { '' })
+            TimeoutSec           = $TimeoutMinutes * 60
+            UiGraceSec           = $UiGraceSeconds
+            SuccessCodes         = @($SuccessCodes)
+            UninstallArgs        = "$UninstallArgs"
+            DetectionScriptBase64= $(if ($DetectionScript) { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($DetectionScript)) } else { '' })
+        }
+        Write-Utf8File -Path (Join-Path $runRoot 'config.json') -Content ($config | ConvertTo-Json -Depth 5)
+
+        Write-PackagerLog "Sandbox $n of $($Candidates.Count): trying [$candidate]"
+        $proc = Start-Process -FilePath $sandboxExe -ArgumentList "`"$wsbPath`"" -PassThru
+        $deadline = (Get-Date).AddSeconds($TimeoutMinutes * 60 * 2 + 300)   # help probe + install + uninstall + boot
+        $logLines = 0
+        $got = $false
+        while ((Get-Date) -lt $deadline)
+        {
+            Start-Sleep -Seconds 2
+            if (Test-Path -LiteralPath $logPath)
+            {
+                $lines = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue)
+                for ($i = $logLines; $i -lt $lines.Count; $i++) { Write-PackagerLog "  sandbox> $($lines[$i])" }
+                $logLines = $lines.Count
+            }
+            else { Invoke-UiRefresh }
+            if (Test-Path -LiteralPath $resultPath) { Start-Sleep -Seconds 2; $got = $true; break }
+            $proc.Refresh()
+            if ($proc.HasExited -and -not (Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue)) { break }
+        }
+
+        # Let the sandbox finish shutting down before starting the next one.
+        $wait = (Get-Date).AddSeconds(90)
+        while ((Get-Date) -lt $wait -and (Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue)) { Start-Sleep -Seconds 2; Invoke-UiRefresh }
+        Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+        if (-not $got)
+        {
+            Write-PackagerLog "No result came back for [$candidate] (sandbox closed or timed out)." -Level Warn
+            $results.Add([pscustomobject]@{ Candidate = $candidate; InstallSucceeded = $false; Error = 'No result from sandbox'; Install = $null; NewEntries = @(); Uninstall = $null; Help = $null; Detection = $null })
+            continue
+        }
+        $r = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+        Copy-Item -LiteralPath $resultPath -Destination (Join-Path $runRoot "result-$n.json") -Force
+        $results.Add($r)
+        if ($r.Error) { Write-PackagerLog "Sandbox reported: $($r.Error)" -Level Warn }
+        if ($r.InstallSucceeded)
+        {
+            Write-PackagerLog "[$candidate] installed silently (exit $($r.Install.ExitCode), $($r.Install.DurationSec)s)."
+            break
+        }
+        $why = if ($r.Install.UiPersisted) { "showed a window: $(@($r.Install.WindowTitles) -join ' | ')" }
+               elseif ($r.Install.TimedOut) { 'timed out' }
+               elseif ($r.Install.StartFailed) { 'did not start' }
+               elseif ($null -eq $r.Install.ExitCode) { 'no exit code' }
+               elseif (@($SuccessCodes) -notcontains [int]$r.Install.ExitCode) { "exit code $($r.Install.ExitCode)" }
+               else { 'exited cleanly but nothing was installed' }
+        Write-PackagerLog "[$candidate] failed: $why" -Level Warn
+    }
+    return $results.ToArray()
+}
+
+function Get-ProbeSummary
+{
+    # Human-readable outcome for the dialog / log.
+    param([Parameter(Mandatory)]$Results)
+    $L = New-Object System.Collections.Generic.List[string]
+    $win = @($Results | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
+    if ($win)
+    {
+        $L.Add("Silent install works with:  $($win.Candidate)")
+        foreach ($e in @($win.NewEntries)) { $L.Add("Registered as: $($e.DisplayName) $($e.DisplayVersion)  (publisher: $($e.Publisher), $($e.Location))") }
+        if ($win.Detection) { $L.Add("Detection script: $(if ($win.Detection.ExitCode -eq 0) { 'DETECTED' } else { 'not detected' })") }
+        if ($win.Uninstall)
+        {
+            $L.Add("Uninstall $(if ($win.Uninstall.Verified) { 'verified' } else { 'attempted, NOT verified' }): `"$($win.Uninstall.File)`" $($win.Uninstall.Arguments)")
+        }
+        elseif (@($win.NewEntries).Count -eq 0) { $L.Add('No Uninstall registry entry appeared; uninstall could not be tested.') }
+    }
+    else
+    {
+        $L.Add('None of the candidates installed silently:')
+        foreach ($r in @($Results))
+        {
+            $i = $r.Install
+            $why = if ($r.Error) { $r.Error } elseif (-not $i) { 'no result' } elseif ($i.UiPersisted) { "shows UI ($(@($i.WindowTitles) -join ' | '))" } elseif ($i.TimedOut) { 'timed out' } else { "exit $($i.ExitCode), nothing registered" }
+            $L.Add("  [$($r.Candidate)] - $why")
+        }
+    }
+    $help = @($Results | Where-Object { $_.Help -and "$($_.Help.Text)".Trim() }) | Select-Object -First 1
+    if ($help)
+    {
+        $switches = @([regex]::Matches($help.Help.Text, '(?<![\w])(?:--?[A-Za-z][\w-]*|/[A-Za-z][\w-]*)') | ForEach-Object { $_.Value } | Select-Object -Unique)
+        if ($switches.Count -gt 0) { $L.Add("Switches mentioned by '$($help.Help.Switch)': $($switches -join ' ')") }
+    }
+    return ($L -join "`n")
+}
+
+function Set-DefinitionFromProbe
+{
+    # Applies a successful probe: install args, verified uninstall, exact detection, and anything the app tab was missing.
+    param([Parameter(Mandatory)]$Def, [Parameter(Mandatory)]$Result)
+    if (-not $Result.InstallSucceeded) { return $Def }
+    $Def.Install.Arguments = "$($Result.Candidate)"
+    $entry = @($Result.NewEntries) | Select-Object -First 1
+    if ($entry)
+    {
+        if (-not "$($Def.App.Vendor)".Trim() -and $entry.Publisher)       { $Def.App.Vendor  = "$($entry.Publisher)".Trim() }
+        if (-not "$($Def.App.Version)".Trim() -and $entry.DisplayVersion) { $Def.App.Version = Get-CleanVersion "$($entry.DisplayVersion)" }
+        $Def.Detection.Type        = 'Registry'
+        $Def.Detection.DisplayName = "$($entry.DisplayName)"
+        $Def.Detection.MatchMode   = 'Exact'
+        $Def.Detection.MinVersion  = Get-CleanVersion "$($entry.DisplayVersion)"
+    }
+    $u = $Result.Uninstall
+    if ($u -and $u.Verified)
+    {
+        if ("$($u.File)" -match '(?i)msiexec' -and "$($u.Arguments)" -match '\{[0-9A-Fa-f\-]{36}\}')
+        {
+            $Def.Uninstall.Type        = 'MSI'
+            $Def.Uninstall.ProductCode = $Matches[0]
+        }
+        else
+        {
+            $Def.Uninstall.Type      = 'EXE'
+            $Def.Uninstall.File      = "$($u.File)"
+            $Def.Uninstall.Arguments = "$($u.Arguments)"
+        }
+    }
+    elseif ($entry)
+    {
+        $Def.Uninstall.Type        = 'Name'
+        $Def.Uninstall.Name        = "$($entry.DisplayName)"
+        $Def.Uninstall.NameIsRegex = $false
+    }
+    return $Def
+}
+
+#endregion
+
+#region ---------------------------------------------------------------- Intune: command lines, app payload, Graph publishing
+
+function Get-PackagePaths
+{
+    # Every generated path is derived from the definition, so a package can be published later without rebuilding.
+    param([Parameter(Mandatory)]$Def)
+    # [IO.Path]::Combine, not Join-Path: this only builds strings and must not touch the
+    # provider (Join-Path fails on a drive that is not currently mapped).
+    $folderName = Get-PackageFolderName -Def $Def
+    $root       = [System.IO.Path]::Combine("$($Def.Output.Destination)", $folderName)
+    $detectName = "Detect-$(Get-SafeName $Def.App.Name).ps1"
+    $winName    = "$folderName.intunewin"
+    return [pscustomobject]@{
+        FolderName   = $folderName
+        Root         = $root
+        Package      = [System.IO.Path]::Combine($root, 'Package')
+        FilesDir     = [System.IO.Path]::Combine($root, 'Package', 'Files')
+        SupportDir   = [System.IO.Path]::Combine($root, 'Package', 'SupportFiles')
+        DetectName   = $detectName
+        DetectScript = [System.IO.Path]::Combine($root, $detectName)
+        IntuneDir    = [System.IO.Path]::Combine($root, 'Intune')
+        IntuneWinName= $winName
+        IntuneWin    = [System.IO.Path]::Combine($root, 'Intune', $winName)
+    }
+}
+
+function Get-DeployModeArgument
+{
+    param([Parameter(Mandatory)]$Def)
+    $mode = if ($script:DeployModeChoices -contains $Def.Output.DeployMode) { $Def.Output.DeployMode } else { 'Silent' }
+    if ($mode -eq 'Auto') { return '' }
+    return " -DeployMode $mode"
+}
+
+function Get-IntuneInstallCommand
+{
+    # The Intune "Install command". Blank override = derived from the deploy mode.
+    param([Parameter(Mandatory)]$Def)
+    $override = "$($Def.Intune.InstallCommand)".Trim()
+    if ($override) { return $override }
+    return "Invoke-AppDeployToolkit.exe -DeploymentType Install$(Get-DeployModeArgument -Def $Def)"
+}
+
+function Get-IntuneUninstallCommand
+{
+    param([Parameter(Mandatory)]$Def)
+    $override = "$($Def.Intune.UninstallCommand)".Trim()
+    if ($override) { return $override }
+    return "Invoke-AppDeployToolkit.exe -DeploymentType Uninstall$(Get-DeployModeArgument -Def $Def)"
+}
+
+function Get-IntuneDisplayName
+{
+    param([Parameter(Mandatory)]$Def)
+    $override = "$($Def.Intune.DisplayName)".Trim()
+    if ($override) { return $override }
+    return (@("$($Def.App.Name)".Trim(), "$($Def.App.Version)".Trim()) | Where-Object { $_ }) -join ' '
+}
+
+function Get-IntuneArchitectures
+{
+    # applicableArchitectures. An x86 package is normally allowed to run on x64 too.
+    param([Parameter(Mandatory)]$Def)
+    $override = "$($Def.Intune.Architecture)".Trim()
+    if ($override) { return $override }
+    switch ("$($Def.App.Arch)".Trim().ToLowerInvariant())
+    {
+        'x64'   { return 'x64' }
+        'x86'   { return 'x86,x64' }
+        'arm64' { return 'arm64' }
+        default { return 'x86,x64' }
+    }
+}
+
+function Get-IntuneReturnCodes
+{
+    # Success / reboot codes come from the Install tab; the rest are the standard PSADT and Windows Installer codes.
+    param([Parameter(Mandatory)]$Def)
+    $ordered = New-Object System.Collections.Generic.List[object]
+    $pairs   = New-Object System.Collections.Generic.List[object]
+
+    foreach ($c in @($Def.Install.SuccessExitCodes | Where-Object { "$_" -match '^-?\d+$' })) { $pairs.Add(@([int]$c, 'success')) }
+    $pairs.Add(@(0, 'success'))
+    $pairs.Add(@(1707, 'success'))
+    foreach ($c in @($Def.Install.RebootExitCodes | Where-Object { "$_" -match '^-?\d+$' }))
+    {
+        if ([int]$c -eq 1641) { $pairs.Add(@(1641, 'hardReboot')) } else { $pairs.Add(@([int]$c, 'softReboot')) }
+    }
+    $pairs.Add(@(1618, 'retry'))    # another installation is already in progress
+    $pairs.Add(@(60012, 'retry'))   # PSADT: user deferred the install
+    $pairs.Add(@(1602, 'failed'))   # user cancelled
+
+    $seen = @{}
+    foreach ($pair in $pairs)
+    {
+        $code = [int]$pair[0]
+        if ($seen.ContainsKey($code)) { continue }
+        $seen[$code] = $true
+        $ordered.Add([ordered]@{ returnCode = $code; type = "$($pair[1])" })
+    }
+    # ToArray(), not ,@($ordered): the unary comma cannot wrap a generic List.
+    return ,$ordered.ToArray()
+}
+
+function New-IntuneAppPayload
+{
+    # Builds the #microsoft.graph.win32LobApp body, filling everything the definition already knows.
+    param
+    (
+        [Parameter(Mandatory)]$Def,
+        [Parameter(Mandatory)][string]$DetectionScript,
+        [string]$IntuneWinFileName
+    )
+    $a  = $Def.App
+    $it = $Def.Intune
+
+    $publisher = "$($it.Publisher)".Trim()
+    if (-not $publisher) { $publisher = "$($a.Vendor)".Trim() }
+    if (-not $publisher) { $publisher = 'Unknown' }
+
+    $description = "$($it.Description)".Trim()
+    if (-not $description)
+    {
+        $description = (@("$($a.Vendor)".Trim(), "$($a.Name)".Trim(), "$($a.Version)".Trim()) | Where-Object { $_ }) -join ' '
+        $description += ", packaged with PSAppDeployToolkit."
+    }
+
+    $notes = "$($it.Notes)".Trim()
+    if (-not $notes)
+    {
+        $notes = "Generated by PSADT Packager $script:PackagerVersion on $(Get-Date -Format 'yyyy-MM-dd'). Rebuild from Package.json."
+    }
+
+    $developer = "$($it.Developer)".Trim(); if (-not $developer) { $developer = "$($a.Vendor)".Trim() }
+    $owner     = "$($it.Owner)".Trim();     if (-not $owner)     { $owner     = "$($a.Author)".Trim() }
+
+    $minOs = if ($script:MinOsCodes -contains "$($it.MinimumOs)") { "$($it.MinimumOs)" } else { 'v10_1809' }
+    $os = [ordered]@{ '@odata.type' = 'microsoft.graph.windowsMinimumOperatingSystem' }
+    $os[$minOs] = $true
+
+    $runAs = if ($script:RunAsChoices -contains "$($it.RunAsAccount)") { "$($it.RunAsAccount)" } else { 'system' }
+    $restart = if ($script:RestartChoices -contains "$($it.RestartBehavior)") { "$($it.RestartBehavior)" } else { 'basedOnReturnCode' }
+    $maxRun = if ("$($it.MaxRunTimeInMinutes)" -match '^\d+$' -and [int]$it.MaxRunTimeInMinutes -gt 0) { [int]$it.MaxRunTimeInMinutes } else { 60 }
+
+    $scriptBytes = [System.Text.Encoding]::UTF8.GetBytes($DetectionScript)
+
+    $payload = [ordered]@{
+        '@odata.type'                = '#microsoft.graph.win32LobApp'
+        displayName                  = Get-IntuneDisplayName -Def $Def
+        description                  = $description
+        publisher                    = $publisher
+        developer                    = $developer
+        owner                        = $owner
+        notes                        = $notes
+        informationUrl               = "$($it.InformationUrl)".Trim()
+        privacyInformationUrl        = "$($it.PrivacyUrl)".Trim()
+        isFeatured                   = $false
+        displayVersion               = "$($a.Version)".Trim()
+        fileName                     = $(if ($IntuneWinFileName) { $IntuneWinFileName } else { (Get-PackagePaths -Def $Def).IntuneWinName })
+        setupFilePath                = 'Invoke-AppDeployToolkit.exe'
+        installCommandLine           = Get-IntuneInstallCommand -Def $Def
+        uninstallCommandLine         = Get-IntuneUninstallCommand -Def $Def
+        applicableArchitectures      = Get-IntuneArchitectures -Def $Def
+        allowAvailableUninstall      = [bool]$it.AllowAvailableUninstall
+        minimumSupportedOperatingSystem = $os
+        msiInformation               = $null
+        installExperience            = [ordered]@{
+            '@odata.type'         = 'microsoft.graph.win32LobAppInstallExperience'
+            runAsAccount          = $runAs
+            deviceRestartBehavior = $restart
+            maxRunTimeInMinutes   = $maxRun
+        }
+        returnCodes                  = Get-IntuneReturnCodes -Def $Def
+        detectionRules               = @(
+            [ordered]@{
+                '@odata.type'         = '#microsoft.graph.win32LobAppPowerShellScriptDetection'
+                enforceSignatureCheck = $false
+                runAs32Bit            = $false
+                scriptContent         = [Convert]::ToBase64String($scriptBytes)
+            }
+        )
+    }
+    return $payload
+}
+
+function ConvertTo-IntuneAppJson
+{
+    param([Parameter(Mandatory)]$Payload)
+    return ($Payload | ConvertTo-Json -Depth 12)
+}
+
+#region ---- Graph authentication (device code, no modules required)
+
+function Get-JwtPayload
+{
+    param([string]$Token)
+    try
+    {
+        $part = $Token.Split('.')[1].Replace('-', '+').Replace('_', '/')
+        switch ($part.Length % 4) { 2 { $part += '==' } 3 { $part += '=' } }
+        return ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part)) | ConvertFrom-Json)
+    }
+    catch { return $null }
+}
+
+function Connect-IntuneGraph
+{
+    # Device code flow against the Microsoft Graph PowerShell public client (or your own app registration).
+    param
+    (
+        [string]$TenantId = 'organizations',
+        [string]$ClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e',
+        [switch]$Silent
+    )
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    if (-not "$TenantId".Trim()) { $TenantId = 'organizations' }
+    if (-not "$ClientId".Trim()) { $ClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e' }
+    $scope = 'https://graph.microsoft.com/DeviceManagementApps.ReadWrite.All offline_access openid profile'
+    $authority = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0"
+
+    $dc = Invoke-RestMethod -Method Post -Uri "$authority/devicecode" -Body @{ client_id = $ClientId; scope = $scope } -ErrorAction Stop
+    Write-PackagerLog "Sign in at $($dc.verification_uri) with code $($dc.user_code)"
+    if (-not $Silent)
+    {
+        try { Set-Clipboard -Value $dc.user_code -ErrorAction SilentlyContinue } catch { }
+        try { Start-Process $dc.verification_uri } catch { }
+    }
+    if ($script:GraphPromptSink) { & $script:GraphPromptSink $dc }
+
+    $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
+    $interval = [Math]::Max(3, [int]$dc.interval)
+    while ((Get-Date) -lt $deadline)
+    {
+        Start-Sleep -Seconds $interval
+        try
+        {
+            $tok = Invoke-RestMethod -Method Post -Uri "$authority/token" -ErrorAction Stop -Body @{
+                grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                client_id   = $ClientId
+                device_code = $dc.device_code
+            }
+            $claims = Get-JwtPayload -Token $tok.access_token
+            $script:GraphToken = [pscustomobject]@{
+                AccessToken  = $tok.access_token
+                RefreshToken = $tok.refresh_token
+                ExpiresOn    = (Get-Date).AddSeconds([int]$tok.expires_in - 300)
+                TenantId     = $(if ($claims) { $claims.tid } else { $TenantId })
+                ClientId     = $ClientId
+                Account      = $(if ($claims) { @($claims.upn, $claims.unique_name, $claims.preferred_username) | Where-Object { $_ } | Select-Object -First 1 } else { '' })
+            }
+            Write-PackagerLog "Connected to Graph as $($script:GraphToken.Account) (tenant $($script:GraphToken.TenantId))"
+            return $script:GraphToken
+        }
+        catch
+        {
+            $body = $null
+            try { $body = ($_.ErrorDetails.Message | ConvertFrom-Json) } catch { }
+            $code = if ($body) { "$($body.error)" } else { '' }
+            if ($code -eq 'authorization_pending') { continue }
+            if ($code -eq 'slow_down') { $interval += 5; continue }
+            if ($code -eq 'authorization_declined') { throw 'Sign-in was declined.' }
+            if ($code -eq 'expired_token') { throw 'The device code expired before sign-in completed.' }
+            if ($code) { throw "Sign-in failed: $code - $($body.error_description)" }
+            throw
+        }
+    }
+    throw 'Timed out waiting for sign-in.'
+}
+
+function Get-GraphAccessToken
+{
+    if (-not $script:GraphToken) { throw 'Not connected to Microsoft Graph. Use Connect on the Intune tab first.' }
+    if ((Get-Date) -lt $script:GraphToken.ExpiresOn) { return $script:GraphToken.AccessToken }
+    if ($script:GraphToken.RefreshToken)
+    {
+        try
+        {
+            $authority = "https://login.microsoftonline.com/$($script:GraphToken.TenantId)/oauth2/v2.0"
+            $tok = Invoke-RestMethod -Method Post -Uri "$authority/token" -ErrorAction Stop -Body @{
+                grant_type    = 'refresh_token'
+                client_id     = $script:GraphToken.ClientId
+                refresh_token = $script:GraphToken.RefreshToken
+                scope         = 'https://graph.microsoft.com/DeviceManagementApps.ReadWrite.All offline_access'
+            }
+            $script:GraphToken.AccessToken  = $tok.access_token
+            $script:GraphToken.ExpiresOn    = (Get-Date).AddSeconds([int]$tok.expires_in - 300)
+            if ($tok.refresh_token) { $script:GraphToken.RefreshToken = $tok.refresh_token }
+            return $script:GraphToken.AccessToken
+        }
+        catch { throw "The Graph token expired and could not be refreshed: $($_.Exception.Message). Connect again." }
+    }
+    throw 'The Graph token expired. Connect again on the Intune tab.'
+}
+
+function Invoke-GraphApi
+{
+    param
+    (
+        [Parameter(Mandatory)][string]$Uri,
+        [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')][string]$Method = 'GET',
+        $Body,
+        [int]$Retries = 4
+    )
+    if ($Uri -notmatch '^https?://') { $Uri = "https://graph.microsoft.com/beta$Uri" }
+    $headers = @{ Authorization = "Bearer $(Get-GraphAccessToken)"; Accept = 'application/json' }
+    $json = $null
+    if ($null -ne $Body) { $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 12 } }
+
+    for ($attempt = 0; $attempt -le $Retries; $attempt++)
+    {
+        try
+        {
+            if ($null -ne $json)
+            {
+                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json' -ErrorAction Stop
+            }
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ErrorAction Stop
+        }
+        catch
+        {
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($attempt -lt $Retries -and ($status -eq 429 -or $status -ge 500))
+            {
+                $wait = [Math]::Pow(2, $attempt) * 2
+                Write-PackagerLog "Graph returned $status; retrying in $wait s" -Level Warn
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            $detail = ''
+            try { $detail = $_.ErrorDetails.Message } catch { }
+            if (-not $detail)
+            {
+                try
+                {
+                    $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $detail = $sr.ReadToEnd(); $sr.Dispose()
+                }
+                catch { }
+            }
+            throw "Graph $Method $Uri failed ($status): $($_.Exception.Message)$(if ($detail) { "`n$detail" })"
+        }
+    }
+}
+
+#endregion
+
+#region ---- .intunewin inspection and content upload
+
+function Read-IntuneWinPackage
+{
+    # A .intunewin is a zip: Metadata\Detection.xml describes the already-encrypted payload in Contents\.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExtractTo)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Package not found: $Path" }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try
+    {
+        $metaEntry = $zip.Entries | Where-Object { $_.FullName -eq 'IntuneWinPackage/Metadata/Detection.xml' } | Select-Object -First 1
+        if (-not $metaEntry) { throw "$Path does not contain IntuneWinPackage\Metadata\Detection.xml - rebuild it with IntuneWinAppUtil." }
+        $sr = New-Object System.IO.StreamReader($metaEntry.Open())
+        try { [xml]$meta = $sr.ReadToEnd() } finally { $sr.Dispose() }
+
+        $contentEntry = $zip.Entries | Where-Object { $_.FullName -eq 'IntuneWinPackage/Contents/IntunePackage.intunewin' } | Select-Object -First 1
+        if (-not $contentEntry) { throw "$Path does not contain the encrypted payload." }
+        if (Test-Path -LiteralPath $ExtractTo) { Remove-Item -LiteralPath $ExtractTo -Force }
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($contentEntry, $ExtractTo, $true)
+
+        $info = $meta.ApplicationInfo
+        $enc  = $info.EncryptionInfo
+        return [pscustomobject]@{
+            Name              = "$($info.Name)"
+            FileName          = "$($info.FileName)"
+            SetupFile         = "$($info.SetupFile)"
+            UnencryptedSize   = [int64]"$($info.UnencryptedContentSize)"
+            EncryptedFilePath = $ExtractTo
+            EncryptedSize     = (Get-Item -LiteralPath $ExtractTo).Length
+            EncryptionInfo    = [ordered]@{
+                encryptionKey        = "$($enc.EncryptionKey)"
+                macKey               = "$($enc.MacKey)"
+                initializationVector = "$($enc.InitializationVector)"
+                mac                  = "$($enc.Mac)"
+                profileIdentifier    = 'ProfileVersion1'
+                fileDigest           = "$($enc.FileDigest)"
+                fileDigestAlgorithm  = "$($enc.FileDigestAlgorithm)"
+            }
+        }
+    }
+    finally { $zip.Dispose() }
+}
+
+function Set-IntuneWinDisplayName
+{
+    # The Add App wizard prefills Name and Description from <Name> in Metadata\Detection.xml.
+    # IntuneWinAppUtil sets it to the setup file, so every PSADT package would show up as
+    # 'Invoke-AppDeployToolkit.exe'. Detection.xml is a plain zip entry outside the encrypted payload.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $entryName = 'IntuneWinPackage/Metadata/Detection.xml'
+    $zip = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Update)
+    try
+    {
+        $entry = $zip.GetEntry($entryName)
+        if (-not $entry) { throw "$Path has no $entryName" }
+        $sr = New-Object System.IO.StreamReader($entry.Open())
+        try { [xml]$meta = $sr.ReadToEnd() } finally { $sr.Dispose() }
+        $meta.ApplicationInfo.Name = $Name
+        $entry.Delete()
+        $entry  = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+        $stream = $entry.Open()
+        try
+        {
+            $settings = New-Object System.Xml.XmlWriterSettings
+            $settings.Indent   = $true
+            $settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+            $writer = [System.Xml.XmlWriter]::Create($stream, $settings)
+            try { $meta.Save($writer) } finally { $writer.Dispose() }
+        }
+        finally { $stream.Dispose() }
+    }
+    finally { $zip.Dispose() }
+}
+
+function Wait-IntuneFileState
+{
+    param([Parameter(Mandatory)][string]$FileUri, [Parameter(Mandatory)][string]$State, [int]$TimeoutSeconds = 600)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline)
+    {
+        $file = Invoke-GraphApi -Uri $FileUri
+        if ($file.uploadState -eq $State) { return $file }
+        if ("$($file.uploadState)" -like '*Failed') { throw "Content upload failed (state: $($file.uploadState))." }
+        Start-Sleep -Seconds 3
+    }
+    throw "Timed out waiting for upload state '$State'."
+}
+
+function Send-IntuneContentFile
+{
+    # Block-uploads the encrypted payload to the SAS URI Intune handed back.
+    param
+    (
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string]$SasUri,
+        [Parameter(Mandatory)][string]$FileUri,
+        [int]$BlockSizeMb = 4
+    )
+    Add-Type -AssemblyName System.Net.Http
+    $blockSize = $BlockSizeMb * 1MB
+    $total     = (Get-Item -LiteralPath $FilePath).Length
+    $blockIds  = New-Object System.Collections.Generic.List[string]
+    $client    = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromMinutes(10)
+    $stream    = [System.IO.File]::OpenRead($FilePath)
+    $renewedAt = Get-Date
+    try
+    {
+        $buffer = New-Object byte[] $blockSize
+        $index  = 0
+        $sent   = [int64]0
+        while (($read = $stream.Read($buffer, 0, $blockSize)) -gt 0)
+        {
+            $id = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($index.ToString('D6')))
+            $blockIds.Add($id)
+
+            # The SAS is short-lived; renew it well before it expires on large packages.
+            if (((Get-Date) - $renewedAt).TotalMinutes -gt 25)
+            {
+                Write-PackagerLog 'Renewing the upload URI'
+                [void](Invoke-GraphApi -Method POST -Uri "$FileUri/renewUpload" -Body @{})
+                $file = Wait-IntuneFileState -FileUri $FileUri -State 'azureStorageUriRenewalSuccess'
+                $SasUri = $file.azureStorageUri
+                $renewedAt = Get-Date
+            }
+
+            $content = New-Object System.Net.Http.ByteArrayContent($buffer, 0, $read)
+            $content.Headers.Add('x-ms-blob-type', 'BlockBlob')
+            $uri = "$SasUri&comp=block&blockid=$([System.Uri]::EscapeDataString($id))"
+            $resp = $client.PutAsync($uri, $content).GetAwaiter().GetResult()
+            if (-not $resp.IsSuccessStatusCode)
+            {
+                $err = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                throw "Block upload failed ($([int]$resp.StatusCode)): $err"
+            }
+            $sent += $read
+            $index++
+            if ($index % 5 -eq 0 -or $sent -eq $total)
+            {
+                Write-PackagerLog ("Uploaded {0:N1} MB of {1:N1} MB" -f ($sent / 1MB), ($total / 1MB))
+            }
+        }
+
+        $xml = "<?xml version=`"1.0`" encoding=`"utf-8`"?><BlockList>" + (($blockIds | ForEach-Object { "<Latest>$_</Latest>" }) -join '') + '</BlockList>'
+        $listContent = New-Object System.Net.Http.StringContent($xml, [System.Text.Encoding]::UTF8, 'text/plain')
+        $resp = $client.PutAsync("$SasUri&comp=blocklist", $listContent).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode)
+        {
+            $err = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            throw "Committing the block list failed ($([int]$resp.StatusCode)): $err"
+        }
+    }
+    finally
+    {
+        $stream.Dispose()
+        $client.Dispose()
+    }
+}
+
+function Publish-IntuneWin32App
+{
+    # Creates the Win32 app, uploads the .intunewin and commits it.
+    param
+    (
+        [Parameter(Mandatory)]$Def,
+        [string]$IntuneWinPath,
+        [string]$DetectionScript
+    )
+    $paths = Get-PackagePaths -Def $Def
+    if (-not $IntuneWinPath) { $IntuneWinPath = $paths.IntuneWin }
+    if (-not (Test-Path -LiteralPath $IntuneWinPath -PathType Leaf))
+    {
+        throw "No .intunewin at $IntuneWinPath. Tick 'Build .intunewin' on the Build tab and generate the package first."
+    }
+    if (-not $DetectionScript)
+    {
+        if (Test-Path -LiteralPath $paths.DetectScript -PathType Leaf) { $DetectionScript = [System.IO.File]::ReadAllText($paths.DetectScript) }
+        else { $DetectionScript = New-DetectionScript -Def $Def }
+    }
+
+    $temp = Join-Path $env:TEMP ("PsadtPackager-{0}.bin" -f [guid]::NewGuid().ToString('N'))
+    try
+    {
+        Write-PackagerLog "Reading $IntuneWinPath"
+        $pkg = Read-IntuneWinPackage -Path $IntuneWinPath -ExtractTo $temp
+
+        $payload = New-IntuneAppPayload -Def $Def -DetectionScript $DetectionScript -IntuneWinFileName (Split-Path -Path $IntuneWinPath -Leaf)
+
+        $existing = $null
+        try
+        {
+            $escaped = "$($payload.displayName)".Replace("'", "''")
+            $found = Invoke-GraphApi -Uri "/deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp') and displayName eq '$escaped'"
+            $existing = @($found.value) | Select-Object -First 1
+        }
+        catch { }
+        if ($existing) { Write-PackagerLog "An app named '$($payload.displayName)' already exists (id $($existing.id)); creating a second one." -Level Warn }
+
+        Write-PackagerLog "Creating Win32 app '$($payload.displayName)'"
+        $app = Invoke-GraphApi -Method POST -Uri '/deviceAppManagement/mobileApps' -Body $payload
+        Write-PackagerLog "App id $($app.id)"
+
+        $appUri = "/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp"
+        $version = Invoke-GraphApi -Method POST -Uri "$appUri/contentVersions" -Body @{}
+        Write-PackagerLog "Content version $($version.id)"
+
+        $fileBody = [ordered]@{
+            '@odata.type'  = '#microsoft.graph.mobileAppContentFile'
+            name           = $pkg.FileName
+            size           = $pkg.UnencryptedSize
+            sizeEncrypted  = $pkg.EncryptedSize
+            manifest       = $null
+            isDependency   = $false
+        }
+        $file = Invoke-GraphApi -Method POST -Uri "$appUri/contentVersions/$($version.id)/files" -Body $fileBody
+        $fileUri = "$appUri/contentVersions/$($version.id)/files/$($file.id)"
+
+        Write-PackagerLog 'Waiting for the upload URI'
+        $file = Wait-IntuneFileState -FileUri $fileUri -State 'azureStorageUriRequestSuccess'
+
+        Write-PackagerLog ("Uploading {0:N1} MB" -f ($pkg.EncryptedSize / 1MB))
+        Send-IntuneContentFile -FilePath $pkg.EncryptedFilePath -SasUri $file.azureStorageUri -FileUri $fileUri
+
+        Write-PackagerLog 'Committing the file'
+        [void](Invoke-GraphApi -Method POST -Uri "$fileUri/commit" -Body @{ fileEncryptionInfo = $pkg.EncryptionInfo })
+        [void](Wait-IntuneFileState -FileUri $fileUri -State 'commitFileSuccess')
+
+        [void](Invoke-GraphApi -Method PATCH -Uri "/deviceAppManagement/mobileApps/$($app.id)" -Body @{
+            '@odata.type'           = '#microsoft.graph.win32LobApp'
+            committedContentVersion = "$($version.id)"
+        })
+
+        $portal = "https://intune.microsoft.com/#view/Microsoft_Intune_Apps/SettingsMenu/~/0/appId/$($app.id)"
+        Write-PackagerLog "Published. Assignments are not set - open $portal"
+        return [pscustomobject]@{ Id = $app.id; DisplayName = $payload.displayName; PortalUrl = $portal }
+    }
+    finally
+    {
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+#endregion
 
 #endregion
 
@@ -1374,7 +2655,20 @@ if ($NoGui)
     {
         $def = Read-PackageDefinition -Path (Resolve-Path -LiteralPath $Definition).Path
         if ($Destination) { $def.Output.Destination = $Destination }
+        if ($TenantId)    { $def.Intune.TenantId = $TenantId }
+        if ($ClientId)    { $def.Intune.ClientId = $ClientId }
+        if ($Publish -and -not $def.Output.BuildIntuneWin)
+        {
+            Write-PackagerLog 'Publishing needs a .intunewin; enabling the build step.' -Level Warn
+            $def.Output.BuildIntuneWin = $true
+        }
         $out = Invoke-PackageBuild -Def $def -Force:$Force
+        if ($Publish -or $def.Intune.PublishAfterBuild)
+        {
+            [void](Connect-IntuneGraph -TenantId $def.Intune.TenantId -ClientId $def.Intune.ClientId -Silent)
+            $app = Publish-IntuneWin32App -Def $def
+            Write-PackagerLog "Intune app id $($app.Id)"
+        }
         Write-Output $out
         exit 0
     }
@@ -1570,6 +2864,7 @@ $xaml = @'
               <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Hint}" Text="File name inside Files\ (pick from the list or type a relative path such as Setup\install.exe)."/>
               <Label Grid.Row="4" Content="Arguments"/>
               <DockPanel Grid.Row="4" Grid.Column="1">
+                <Button DockPanel.Dock="Right" Name="BtnProbeSandbox" Content="Find switches in Sandbox..." Margin="6,3,0,3" ToolTip="Runs the installer inside Windows Sandbox with candidate silent switches, records what gets registered and tests the uninstall. Nothing runs on this PC."/>
                 <ComboBox DockPanel.Dock="Right" Name="InstallPreset" Width="200" Margin="6,3,0,3"/>
                 <TextBox Name="InstallArgs" FontFamily="Consolas"/>
               </DockPanel>
@@ -1733,6 +3028,93 @@ $xaml = @'
             <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="Generate copies sources, creates the PSADT template (downloads the toolkit once if needed), writes the scripts, syntax-checks them and saves Package.json next to the package."/>
             <TextBox Grid.Row="7" Grid.Column="1" Name="OutPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
           </Grid>
+        </TabItem>
+
+        <TabItem Header="  7. Intune  " Name="TabIntune">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <Grid Margin="12">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="170"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                       Text="Everything below is filled in from the other tabs; anything you type here overrides it. Publish creates the Win32 app, uploads the .intunewin and sets the commands, detection rule, return codes and requirements. Assignments are left for you."/>
+
+            <Label Grid.Row="1" Content="Tenant"/>
+            <DockPanel Grid.Row="1" Grid.Column="1">
+              <Button DockPanel.Dock="Right" Name="BtnGraphConnect" Content="Connect..." Padding="14,4"/>
+              <TextBox Name="IntTenantId" Width="260" HorizontalAlignment="Left"/>
+              <TextBlock Name="IntConnStatus" Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Not connected. Blank tenant = whichever tenant you sign in to."/>
+            </DockPanel>
+
+            <Label Grid.Row="2" Content="App registration"/>
+            <DockPanel Grid.Row="2" Grid.Column="1">
+              <TextBox Name="IntClientId" Width="330" HorizontalAlignment="Left"/>
+              <TextBlock Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Blank = Microsoft Graph PowerShell client. Needs DeviceManagementApps.ReadWrite.All."/>
+            </DockPanel>
+
+            <Label Grid.Row="3" Content="Name"/>
+            <TextBox Grid.Row="3" Grid.Column="1" Name="IntDisplayName"/>
+
+            <Label Grid.Row="4" Content="Publisher"/>
+            <TextBox Grid.Row="4" Grid.Column="1" Name="IntPublisher"/>
+
+            <Label Grid.Row="5" Content="Description"/>
+            <TextBox Grid.Row="5" Grid.Column="1" Name="IntDescription" Height="54" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+
+            <Label Grid.Row="6" Content="Developer / Owner"/>
+            <DockPanel Grid.Row="6" Grid.Column="1">
+              <TextBox Name="IntDeveloper" Width="300" HorizontalAlignment="Left"/>
+              <TextBox Name="IntOwner" Width="240" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+            </DockPanel>
+
+            <Label Grid.Row="7" Content="Information / Privacy URL"/>
+            <DockPanel Grid.Row="7" Grid.Column="1">
+              <TextBox Name="IntInfoUrl" Width="300" HorizontalAlignment="Left"/>
+              <TextBox Name="IntPrivacyUrl" Width="300" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+            </DockPanel>
+
+            <Label Grid.Row="8" Content="Install command"/>
+            <TextBox Grid.Row="8" Grid.Column="1" Name="IntInstallCmd" Style="{StaticResource Code}"/>
+
+            <Label Grid.Row="9" Content="Uninstall command"/>
+            <TextBox Grid.Row="9" Grid.Column="1" Name="IntUninstallCmd" Style="{StaticResource Code}"/>
+
+            <Label Grid.Row="10" Content="Install behavior"/>
+            <DockPanel Grid.Row="10" Grid.Column="1">
+              <ComboBox DockPanel.Dock="Left" Name="IntRunAs" Width="200"/>
+              <ComboBox DockPanel.Dock="Left" Name="IntRestart" Width="290" Margin="8,3,0,3"/>
+              <TextBox Name="IntMaxRunTime" Width="60" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+              <TextBlock Style="{StaticResource Hint}" Margin="8,6,0,0" Text="max run time (minutes)"/>
+            </DockPanel>
+
+            <Label Grid.Row="11" Content="Requirements"/>
+            <DockPanel Grid.Row="11" Grid.Column="1">
+              <ComboBox DockPanel.Dock="Left" Name="IntMinOs" Width="220"/>
+              <ComboBox DockPanel.Dock="Left" Name="IntArch" Width="130" Margin="8,3,0,3" IsEditable="True"/>
+              <CheckBox Name="IntAllowUninstall" Content="Allow uninstall for Available assignments" Margin="12,6,0,0"/>
+            </DockPanel>
+
+            <Label Grid.Row="12" Content="Detection"/>
+            <TextBlock Grid.Row="12" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,6,0,0"
+                       Text="The script from tab 5 is uploaded as the detection rule (64-bit, no signature check). Return codes come from the Install tab."/>
+
+            <StackPanel Grid.Row="13" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,4">
+              <Button Name="BtnIntunePublish" Content="Publish to Intune" FontWeight="Bold" Padding="18,6" Margin="0,3,0,3"/>
+              <Button Name="BtnIntunePreview" Content="Preview app JSON"/>
+              <Button Name="BtnIntuneReset" Content="Reset to auto values"/>
+            </StackPanel>
+
+            <TextBox Grid.Row="14" Grid.Column="1" Name="IntPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA" MinHeight="120"/>
+          </Grid>
+          </ScrollViewer>
         </TabItem>
 
       </TabControl>
@@ -1911,6 +3293,24 @@ function Get-UiDefinition
     $d.Detection.PackageName      = $u.DetectPackageName.Text.Trim()
     $d.Detection.Script           = $u.DetectScript.Text
 
+    $d.Intune.TenantId                = $u.IntTenantId.Text.Trim()
+    $d.Intune.ClientId                = $u.IntClientId.Text.Trim()
+    $d.Intune.DisplayName             = $u.IntDisplayName.Text.Trim()
+    $d.Intune.Publisher               = $u.IntPublisher.Text.Trim()
+    $d.Intune.Description             = $u.IntDescription.Text.Trim()
+    $d.Intune.Developer               = $u.IntDeveloper.Text.Trim()
+    $d.Intune.Owner                   = $u.IntOwner.Text.Trim()
+    $d.Intune.InformationUrl          = $u.IntInfoUrl.Text.Trim()
+    $d.Intune.PrivacyUrl              = $u.IntPrivacyUrl.Text.Trim()
+    $d.Intune.InstallCommand          = $u.IntInstallCmd.Text.Trim()
+    $d.Intune.UninstallCommand        = $u.IntUninstallCmd.Text.Trim()
+    $d.Intune.RunAsAccount            = Get-ComboCode $u.IntRunAs $script:RunAsChoices 'system'
+    $d.Intune.RestartBehavior         = Get-ComboCode $u.IntRestart $script:RestartChoices 'basedOnReturnCode'
+    $d.Intune.MaxRunTimeInMinutes     = if ($u.IntMaxRunTime.Text -match '^\d+$') { [int]$u.IntMaxRunTime.Text } else { 60 }
+    $d.Intune.MinimumOs               = Get-ComboCode $u.IntMinOs $script:MinOsCodes 'v10_1809'
+    $d.Intune.Architecture            = "$($u.IntArch.Text)".Trim()
+    $d.Intune.AllowAvailableUninstall = [bool]$u.IntAllowUninstall.IsChecked
+
     $d.Output.Destination      = $u.OutDestination.Text.Trim()
     $d.Output.DeployMode       = Get-ComboCode $u.OutDeployMode $script:DeployModeChoices 'Silent'
     $d.Output.BuildIntuneWin   = [bool]$u.OutBuildIntuneWin.IsChecked
@@ -1974,6 +3374,25 @@ function Set-UiDefinition
     $u.DetectPackageName.Text       = "$($d.Detection.PackageName)"
     $u.DetectScript.Text            = "$($d.Detection.Script)"
 
+    $script:IntuneAutoFilled = @{}
+    $u.IntTenantId.Text       = "$($d.Intune.TenantId)"
+    $u.IntClientId.Text       = "$($d.Intune.ClientId)"
+    $u.IntDisplayName.Text    = "$($d.Intune.DisplayName)"
+    $u.IntPublisher.Text      = "$($d.Intune.Publisher)"
+    $u.IntDescription.Text    = "$($d.Intune.Description)"
+    $u.IntDeveloper.Text      = "$($d.Intune.Developer)"
+    $u.IntOwner.Text          = "$($d.Intune.Owner)"
+    $u.IntInfoUrl.Text        = "$($d.Intune.InformationUrl)"
+    $u.IntPrivacyUrl.Text     = "$($d.Intune.PrivacyUrl)"
+    $u.IntInstallCmd.Text     = "$($d.Intune.InstallCommand)"
+    $u.IntUninstallCmd.Text   = "$($d.Intune.UninstallCommand)"
+    Set-ComboCode $u.IntRunAs $script:RunAsChoices $d.Intune.RunAsAccount
+    Set-ComboCode $u.IntRestart $script:RestartChoices $d.Intune.RestartBehavior
+    $u.IntMaxRunTime.Text     = "$($d.Intune.MaxRunTimeInMinutes)"
+    Set-ComboCode $u.IntMinOs $script:MinOsCodes $d.Intune.MinimumOs 4
+    $u.IntArch.Text           = "$($d.Intune.Architecture)"
+    $u.IntAllowUninstall.IsChecked = [bool]$d.Intune.AllowAvailableUninstall
+
     if ("$($d.Output.Destination)") { $u.OutDestination.Text = "$($d.Output.Destination)" }
     Set-ComboCode $u.OutDeployMode $script:DeployModeChoices $d.Output.DeployMode
     $u.OutBuildIntuneWin.IsChecked = [bool]$d.Output.BuildIntuneWin
@@ -1990,6 +3409,7 @@ function Update-FieldStates
     $u.BtnInstallAutoFill.IsEnabled = $it -ne 'Custom'
     $u.InstallArgs.IsEnabled        = $it -ne 'Custom'
     $u.InstallPreset.IsEnabled      = $it -eq 'EXE'
+    $u.BtnProbeSandbox.IsEnabled    = $it -eq 'EXE'
     $u.InstallTransforms.IsEnabled  = $it -eq 'MSI'
     $u.InstallProductCode.IsEnabled = $it -eq 'MSI'
     $u.InstallCustom.IsEnabled      = $it -eq 'Custom'
@@ -2043,9 +3463,14 @@ function Import-InstallerIntoUi
         if ($info.ProductCode) { $summary += "  ProductCode: $($info.ProductCode)" }
         if ($info.PackageName) { $summary += "  Package: $($info.PackageName)" }
         Write-PackagerLog $summary
-        if ($info.Type -eq 'EXE' -and $info.Engine -eq 'Unknown')
+        if ($info.Type -eq 'EXE')
         {
-            Write-PackagerLog 'Installer engine not recognised; enter the silent switches manually.' -Level Warn
+            $hits = @(Find-InstallerSwitchStrings -Path $Path)
+            if ($hits.Count -gt 0) { Write-PackagerLog "Switch strings present in the binary: $($hits -join ', ')" }
+            if ($info.Engine -eq 'Unknown')
+            {
+                Write-PackagerLog "Installer engine not recognised. Use 'Find switches in Sandbox' on the Install tab to test candidates safely." -Level Warn
+            }
         }
     }
     catch
@@ -2125,6 +3550,8 @@ function Read-PackagerSettings
             if ($s.Destination)      { $script:ui.OutDestination.Text   = "$($s.Destination)" }
             if ($s.IntuneWinAppUtil) { $script:ui.OutIntuneWinTool.Text = "$($s.IntuneWinAppUtil)" }
             if ($s.Author)           { $script:ui.AppAuthor.Text        = "$($s.Author)" }
+            if ($s.TenantId)         { $script:ui.IntTenantId.Text      = "$($s.TenantId)" }
+            if ($s.ClientId)         { $script:ui.IntClientId.Text      = "$($s.ClientId)" }
         }
     }
     catch { }
@@ -2144,6 +3571,8 @@ function Save-PackagerSettings
             Destination      = $script:ui.OutDestination.Text.Trim()
             IntuneWinAppUtil = $script:ui.OutIntuneWinTool.Text.Trim()
             Author           = $script:ui.AppAuthor.Text.Trim()
+            TenantId         = $script:ui.IntTenantId.Text.Trim()
+            ClientId         = $script:ui.IntClientId.Text.Trim()
         } | ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
     }
     catch { }
@@ -2158,6 +3587,10 @@ $script:ui.UninstallAppType.ItemsSource= $script:AppTypeCodes
 $script:ui.AppArch.ItemsSource         = $script:ArchChoices
 $script:ui.OutDeployMode.ItemsSource   = $script:DeployModeChoices
 $script:ui.InstallPreset.ItemsSource   = @($script:SilentPresets.Values | ForEach-Object { $_.Label })
+$script:ui.IntRunAs.ItemsSource        = $script:RunAsLabels
+$script:ui.IntRestart.ItemsSource      = $script:RestartLabels
+$script:ui.IntMinOs.ItemsSource        = $script:MinOsLabels
+$script:ui.IntArch.ItemsSource         = $script:ArchChoicesIntune
 
 # ---- Event wiring
 $script:ui.MenuNew.Add_Click({
@@ -2226,6 +3659,78 @@ $script:ui.InstallPreset.Add_SelectionChanged({
     if ($preset.Uninstall -and (Get-ComboCode $script:ui.UninstallType $script:UninstallTypeCodes 'MSI') -in @('Name', 'EXE') -and -not $script:ui.UninstallArgs.Text.Trim())
     {
         $script:ui.UninstallArgs.Text = $preset.Uninstall
+    }
+})
+
+$script:ui.BtnProbeSandbox.Add_Click({
+    $def = Get-UiDefinition
+    if ($def.Install.Type -ne 'EXE') { Show-Message -Text 'The sandbox probe is for EXE installers.' -Icon Information; return }
+    $name = "$($def.Install.File)".Trim()
+    if (-not $name) { Show-Message -Text 'Select the installer file first (Source files tab, then Install tab).' -Icon Warning; return }
+    $installer = $null
+    foreach ($src in @($def.Sources.Files))
+    {
+        $s = "$src"
+        if ($s.EndsWith('\*')) { $c = Join-Path $s.Substring(0, $s.Length - 2) $name; if (Test-Path -LiteralPath $c -PathType Leaf) { $installer = $c; break } }
+        elseif (Test-Path -LiteralPath $s -PathType Container) { $c = Join-Path (Split-Path -Path $s -Parent) $name; if (Test-Path -LiteralPath $c -PathType Leaf) { $installer = $c; break } }
+        elseif ((Split-Path -Path $s -Leaf) -ieq (Split-Path -Path $name -Leaf) -and (Test-Path -LiteralPath $s -PathType Leaf)) { $installer = $s; break }
+    }
+    if (-not $installer) { Show-Message -Text "Could not find '$name' among the source files." -Icon Warning; return }
+    if (-not (Test-WindowsSandbox))
+    {
+        Show-Message -Text "Windows Sandbox is not available on this PC.`n`nEnable it (Windows Features > Windows Sandbox, or Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM) and try again." -Title 'Find switches' -Icon Warning
+        return
+    }
+
+    $engine = 'Unknown'
+    try { $engine = Get-InstallerEngine -Path $installer } catch { }
+    $candidates = @(Get-SilentCandidates -Path $installer -Engine $engine -CurrentArgs $def.Install.Arguments -Max 4)
+    $preset = $script:SilentPresets[$engine]
+    $uninstallArgs = if ($preset) { $preset.Uninstall } else { '' }
+    $msg = "Installer: $installer`nEngine: $engine`n`nEach candidate boots a fresh Windows Sandbox (about 1-3 minutes each), runs the installer with those switches, checks what got registered, runs your detection script and tests the uninstall.`n`nCandidates, in order:`n  " + ($candidates -join "`n  ") + "`n`nA sandbox window will open on screen - leave it alone. Continue?"
+    if (-not (Confirm-Action -Text $msg -Title 'Find switches in Sandbox')) { return }
+
+    $detection = $null
+    try { $detection = New-DetectionScript -Def $def } catch { }
+    $success = @($def.Install.SuccessExitCodes | Where-Object { "$_" -match '^-?\d+$' } | ForEach-Object { [int]$_ }) + @($def.Install.RebootExitCodes | Where-Object { "$_" -match '^-?\d+$' } | ForEach-Object { [int]$_ })
+    if ($success.Count -eq 0) { $success = @(0, 3010, 1641) }
+
+    $script:ui.BtnProbeSandbox.IsEnabled = $false
+    $script:Window.Cursor = [System.Windows.Input.Cursors]::AppStarting
+    try
+    {
+        $results = @(Invoke-SandboxProbe -InstallerPath $installer -Candidates $candidates -DetectionScript $detection -UninstallArgs $uninstallArgs -SuccessCodes $success)
+        $summary = Get-ProbeSummary -Results $results
+        foreach ($line in ($summary -split "`n")) { Write-PackagerLog $line }
+        $win = @($results | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
+        if ($win)
+        {
+            if (Confirm-Action -Text "$summary`n`nApply these to the Install, Uninstall and Detection tabs?" -Title 'Sandbox result')
+            {
+                $current = Get-UiDefinition
+                [void](Set-DefinitionFromProbe -Def $current -Result $win)
+                Set-UiDefinition -d $current
+                $keys = @($script:SilentPresets.Keys)
+                $idx = [Array]::IndexOf($keys, $engine); if ($idx -lt 0) { $idx = [Array]::IndexOf($keys, 'Unknown') }
+                $script:ui.InstallPreset.SelectedIndex = $idx
+                $script:ui.InstallArgs.Text = "$($win.Candidate)"
+                Write-PackagerLog 'Applied the sandbox result to the definition.'
+            }
+        }
+        else
+        {
+            Show-Message -Text "$summary`n`nThe help output above (if any) may name the right switch - enter it in Arguments and run the probe again to verify it." -Title 'Sandbox result' -Icon Warning
+        }
+    }
+    catch
+    {
+        Write-PackagerLog "Sandbox probe failed: $($_.Exception.Message)" -Level Error
+        Show-Message -Text $_.Exception.Message -Title 'Find switches' -Icon Error
+    }
+    finally
+    {
+        $script:Window.Cursor = $null
+        $script:ui.BtnProbeSandbox.IsEnabled = $true
     }
 })
 
@@ -2313,6 +3818,135 @@ $script:ui.BtnGenerate.Add_Click({
         $script:ui.BtnGenerate.IsEnabled = $true
     }
 })
+
+# ---- Intune tab
+$script:IntuneAutoFilled = @{}
+
+function Set-IntuneAutoField
+{
+    # Fills a box with a derived value, and keeps it in step with the other tabs until the user edits it.
+    param([Parameter(Mandatory)]$Box, [string]$Value, [Parameter(Mandatory)][string]$Key)
+    $current = "$($Box.Text)"
+    $isAuto  = $script:IntuneAutoFilled.ContainsKey($Key) -and $script:IntuneAutoFilled[$Key] -ceq $current
+    if ($current.Trim() -and -not $isAuto) { return }   # the user typed their own value; leave it alone
+    $Box.Text = $Value
+    $script:IntuneAutoFilled[$Key] = $Value
+}
+
+function Update-IntuneAutoFields
+{
+    # Everything the other tabs already imply, filled in without the user retyping it.
+    $u   = $script:ui
+    $def = Get-UiDefinition
+    $auto = New-IntuneAppPayload -Def $def -DetectionScript '#'
+    Set-IntuneAutoField -Box $u.IntDisplayName  -Key 'DisplayName'  -Value (Get-IntuneDisplayName -Def $def)
+    Set-IntuneAutoField -Box $u.IntPublisher    -Key 'Publisher'    -Value "$($def.App.Vendor)".Trim()
+    Set-IntuneAutoField -Box $u.IntDeveloper    -Key 'Developer'    -Value "$($def.App.Vendor)".Trim()
+    Set-IntuneAutoField -Box $u.IntOwner        -Key 'Owner'        -Value "$($def.App.Author)".Trim()
+    Set-IntuneAutoField -Box $u.IntDescription  -Key 'Description'  -Value $auto.description
+    Set-IntuneAutoField -Box $u.IntInstallCmd   -Key 'InstallCmd'   -Value (Get-IntuneInstallCommand -Def $def)
+    Set-IntuneAutoField -Box $u.IntUninstallCmd -Key 'UninstallCmd' -Value (Get-IntuneUninstallCommand -Def $def)
+    Set-IntuneAutoField -Box $u.IntArch         -Key 'Arch'         -Value (Get-IntuneArchitectures -Def $def)
+}
+
+$script:ui.Tabs.Add_SelectionChanged({
+    param($EventSender, $EventArgs)
+    # SelectionChanged bubbles up from the combo boxes inside each tab, so only react to the TabControl's own event.
+    if ($EventArgs.Source -ne $script:ui.Tabs) { return }
+    if ($script:ui.Tabs.SelectedItem -eq $script:ui.TabIntune) { try { Update-IntuneAutoFields } catch { } }
+})
+
+$script:ui.BtnIntuneReset.Add_Click({
+    $u = $script:ui
+    foreach ($box in @($u.IntDisplayName, $u.IntPublisher, $u.IntDescription, $u.IntDeveloper, $u.IntOwner, $u.IntInstallCmd, $u.IntUninstallCmd)) { $box.Text = '' }
+    $u.IntArch.Text = ''
+    $script:IntuneAutoFilled = @{}
+    Update-IntuneAutoFields
+    Write-PackagerLog 'Intune fields reset to the values derived from the other tabs.'
+})
+
+$script:ui.BtnGraphConnect.Add_Click({
+    try
+    {
+        $script:ui.BtnGraphConnect.IsEnabled = $false
+        $script:ui.IntConnStatus.Text = 'Waiting for sign-in...'
+        $script:GraphPromptSink = {
+            param($Dc)
+            $script:ui.IntConnStatus.Text = "Enter code $($Dc.user_code) in the browser (copied to your clipboard)."
+            Invoke-UiRefresh
+        }
+        $tok = Connect-IntuneGraph -TenantId $script:ui.IntTenantId.Text.Trim() -ClientId $script:ui.IntClientId.Text.Trim()
+        $script:ui.IntConnStatus.Text = "Connected as $($tok.Account) - tenant $($tok.TenantId)"
+        if (-not $script:ui.IntTenantId.Text.Trim()) { $script:ui.IntTenantId.Text = $tok.TenantId }
+    }
+    catch
+    {
+        $script:ui.IntConnStatus.Text = 'Not connected.'
+        Write-PackagerLog "Graph sign-in failed: $($_.Exception.Message)" -Level Error
+        Show-Message -Text $_.Exception.Message -Title 'Connect to Intune' -Icon Error
+    }
+    finally
+    {
+        $script:GraphPromptSink = $null
+        $script:ui.BtnGraphConnect.IsEnabled = $true
+    }
+})
+
+$script:ui.BtnIntunePreview.Add_Click({
+    try
+    {
+        Update-IntuneAutoFields
+        $def = Get-UiDefinition
+        $script:ui.IntPreview.Text = ConvertTo-IntuneAppJson -Payload (New-IntuneAppPayload -Def $def -DetectionScript (New-DetectionScript -Def $def))
+    }
+    catch { Show-Message -Text $_.Exception.Message -Title 'Preview app JSON' -Icon Error }
+})
+
+$script:ui.BtnIntunePublish.Add_Click({
+    Update-IntuneAutoFields
+    $def = Get-UiDefinition
+    $problems = Test-PackageDefinition -Def $def
+    if ($problems.Count -gt 0)
+    {
+        Show-Message -Text ("Fix these first:`n`n - " + ($problems -join "`n - ")) -Title 'Definition incomplete' -Icon Warning
+        return
+    }
+    $paths = Get-PackagePaths -Def $def
+    if (-not (Test-Path -LiteralPath $paths.IntuneWin -PathType Leaf))
+    {
+        Show-Message -Text "No .intunewin at`n$($paths.IntuneWin)`n`nTick 'Build .intunewin' on the Build tab and generate the package first." -Title 'Publish to Intune' -Icon Warning
+        return
+    }
+    if (-not $script:GraphToken)
+    {
+        Show-Message -Text 'Connect to your tenant first.' -Title 'Publish to Intune' -Icon Warning
+        return
+    }
+    if (-not (Confirm-Action -Text "Create '$(Get-IntuneDisplayName -Def $def)' in tenant $($script:GraphToken.TenantId)?`n`nNo assignments are created.")) { return }
+
+    $script:ui.BtnIntunePublish.IsEnabled = $false
+    $script:Window.Cursor = [System.Windows.Input.Cursors]::Wait
+    try
+    {
+        $app = Publish-IntuneWin32App -Def $def -IntuneWinPath $paths.IntuneWin
+        $script:ui.IntPreview.Text = "Published $($app.DisplayName)`r`nApp id: $($app.Id)`r`n$($app.PortalUrl)"
+        if (Confirm-Action -Text "Published '$($app.DisplayName)'.`n`nOpen it in the Intune portal?")
+        {
+            Start-Process $app.PortalUrl
+        }
+    }
+    catch
+    {
+        Write-PackagerLog $_.Exception.Message -Level Error
+        Show-Message -Text $_.Exception.Message -Title 'Publish failed' -Icon Error
+    }
+    finally
+    {
+        $script:Window.Cursor = $null
+        $script:ui.BtnIntunePublish.IsEnabled = $true
+    }
+})
+
 $script:Window.Add_Closing({ Save-PackagerSettings })
 
 # ---- Initial state
