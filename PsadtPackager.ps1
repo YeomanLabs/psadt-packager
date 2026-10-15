@@ -118,7 +118,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUN
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.1.3'
+$script:PackagerVersion = '1.1.4'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -1851,6 +1851,7 @@ public static class ProbeWin
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, StringBuilder l, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr h, int index);
+    [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr h);
     const uint WM_GETTEXT = 0x000D;
     const uint WM_GETTEXTLENGTH = 0x000E;
     const uint SMTO_ABORTIFHUNG = 0x0002;
@@ -1906,6 +1907,42 @@ public static class ProbeWin
             return true;
         }, IntPtr.Zero);
         return list;
+    }
+
+    // The control and every parent up to the top-level window have WS_VISIBLE (pages are often hidden panels).
+    static bool ChainShown(IntPtr h, IntPtr top)
+    {
+        for (int depth = 0; h != IntPtr.Zero && h != top && depth < 32; depth++)
+        {
+            if ((GetWindowLong32(h, -16) & 0x10000000) == 0) return false;
+            h = GetParent(h);
+        }
+        return true;
+    }
+
+    // Only the controls on show: WiX Burn's window holds every page (help, progress, options ...) and hides the rest, so
+    // all of its texts together would quote its help page while it is only showing progress.
+    public static List<string> ShownChildTexts(long handle)
+    {
+        var list = new List<string>();
+        EnumChildWindows(new IntPtr(handle), delegate (IntPtr h, IntPtr l) {
+            if (!ChainShown(h, new IntPtr(handle))) return true;
+            string t = Text(h);
+            if (!string.IsNullOrEmpty(t)) list.Add(t);
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    // A window showing a progress bar is reporting progress (/passive modes), not waiting for a click.
+    public static bool ShowsProgress(long handle)
+    {
+        bool found = false;
+        EnumChildWindows(new IntPtr(handle), delegate (IntPtr h, IntPtr l) {
+            if (ClassOf(h).IndexOf("progress", StringComparison.OrdinalIgnoreCase) >= 0 && ChainShown(h, new IntPtr(handle))) { found = true; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
     }
 
     // A window that waits for a person has controls: a button, or several labelled controls (message boxes, wizards).
@@ -2037,11 +2074,17 @@ function Invoke-Monitored
             if (-not $tree.Contains([int]$parts[0])) { continue }
             if ($IgnoredWindowClasses -contains $parts[2] -or $parts[3] -match $IgnoredWindowTitles) { continue }
             $shown = [ProbeWin]::Shown([int64]$parts[1])
-            $label = "$($parts[3]) [$($parts[2])$(if (-not $shown) { ', hidden' })]"
+            # A window showing a progress bar (/passive installs, chained redistributables) is not waiting for anyone.
+            $progress = $shown -and [ProbeWin]::ShowsProgress([int64]$parts[1])
+            $label = "$($parts[3]) [$($parts[2])$(if (-not $shown) { ', hidden' } elseif ($progress) { ', progress' })]"
             if (-not $titles.Contains($label)) { $titles.Add($label) }
             $windows.Add($parts[1])
-            if ($shown -and ([ProbeWin]::LooksInteractive([int64]$parts[1]) -or $parts[2] -match '^(HwndWrapper|Chrome_WidgetWin|#32770$)')) { $dialogs.Add($parts[1]) }
+            if ($shown -and -not $progress -and ([ProbeWin]::LooksInteractive([int64]$parts[1]) -or $parts[2] -match '^(HwndWrapper|Chrome_WidgetWin|#32770$)')) { $dialogs.Add($parts[1]) }
         }
+        # Every MSI install pauses for about two minutes in Windows Sandbox (software restriction check) with nothing
+        # moving, so while Windows Installer is running a window gets that long before it counts as waiting for a click.
+        $grace = $UiGraceSec
+        if (@($table.Values | Where-Object { $_.Name -eq 'msiexec.exe' }).Count -gt 0) { $grace = [Math]::Max($UiGraceSec, 150) }
         if ($CaptureText)
         {
             foreach ($h in $windows) { foreach ($t in [ProbeWin]::ChildTexts([int64]$h)) { if (-not $texts.Contains($t)) { $texts.Add($t) } } }
@@ -2060,11 +2103,11 @@ function Invoke-Monitored
         if ($StopAfterSec -gt 0 -and ($now -ge $StopAfterSec -or ($dialogs.Count -gt 0 -and $idle -ge 4))) { break }
         if ($rootAlive)
         {
-            if ($dialogs.Count -gt 0 -and $idle -ge $UiGraceSec)
+            if ($dialogs.Count -gt 0 -and $idle -ge $grace)
             {
-                # Say what the dialog says (an error, a licence, a question), not just its title; buttons left out.
+                # Say what the dialog shows (an error, a licence, a question), not just its title; buttons left out.
                 $current = @($titles | Select-Object -Last 3) -join ' | '
-                $said = @(foreach ($h in $dialogs) { [ProbeWin]::ChildTexts([int64]$h) }) | Where-Object { $_ -and $_.Trim().Length -gt 3 -and $_.Trim() -notmatch '^(?i)&?(OK|Cancel|Close|Yes|No|Next\s*>?|Install|Retry|Finish|Browse\.*|I Agree|Accept)$|^<\s*&?Back$' } | Select-Object -Unique
+                $said = @(foreach ($h in $dialogs) { [ProbeWin]::ShownChildTexts([int64]$h) }) | Where-Object { $_ -and $_.Trim().Length -gt 3 -and $_.Trim() -notmatch '^(?i)&?(OK|Cancel|Close|Yes|No|Next\s*>?|Install|Retry|Finish|Browse\.*|I Agree|Accept)$|^<\s*&?Back$' } | Select-Object -Unique
                 $saidText = ((@($said) -join ' / ') -replace '\s+', ' ').Trim()
                 if ($saidText.Length -gt 220) { $saidText = $saidText.Substring(0, 217) + '...' }
                 $stuck = "waiting on a window ($current)$(if ($saidText) { ': "' + $saidText + '"' }) with no activity for $([int]$idle)s"
