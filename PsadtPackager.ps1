@@ -118,7 +118,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUN
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.1.4'
+$script:PackagerVersion = '1.2.0'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -1934,6 +1934,40 @@ public static class ProbeWin
         return list;
     }
 
+    // Files created since sinceUtc under the roots (folders under a skip prefix left out, junctions not followed):
+    // "count|newest file|partial" - partial when maxMs ran out before every folder was seen.
+    public static string NewFilesSince(string[] roots, string[] skip, DateTime sinceUtc, int maxMs)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long count = 0;
+        DateTime newest = DateTime.MinValue;
+        string newestPath = "";
+        var stack = new Stack<string>();
+        foreach (string r in roots) { if (!string.IsNullOrEmpty(r) && System.IO.Directory.Exists(r)) stack.Push(r); }
+        while (stack.Count > 0 && sw.ElapsedMilliseconds < maxMs)
+        {
+            string dir = stack.Pop();
+            try
+            {
+                var di = new System.IO.DirectoryInfo(dir);
+                foreach (var f in di.EnumerateFiles())
+                {
+                    DateTime c = f.CreationTimeUtc;
+                    if (c >= sinceUtc) { count++; if (c > newest) { newest = c; newestPath = f.FullName; } }
+                }
+                foreach (var d in di.EnumerateDirectories())
+                {
+                    if ((d.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) continue;
+                    bool skipped = false;
+                    foreach (string s in skip) { if ((d.FullName + "\\").StartsWith(s, StringComparison.OrdinalIgnoreCase)) { skipped = true; break; } }
+                    if (!skipped) stack.Push(d.FullName);
+                }
+            }
+            catch { }
+        }
+        return count + "|" + newestPath + "|" + (stack.Count > 0 ? "partial" : "");
+    }
+
     // A window showing a progress bar is reporting progress (/passive modes), not waiting for a click.
     public static bool ShowsProgress(long handle)
     {
@@ -1959,6 +1993,11 @@ public static class ProbeWin
     }
 }
 "@
+
+# Where installs write: the heartbeat counts files created here since the run began, so the log shows whether an
+# install is moving. ProgramData\Microsoft is Windows' own busy corner; its Start menu is counted on its own.
+$ProgressRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'), (Join-Path $env:SystemRoot 'Installer')) | Where-Object { $_ } | Select-Object -Unique
+$ProgressSkip  = @('Microsoft', 'USOShared', 'USOPrivate', 'Packages', 'regid.1991-06.com.microsoft') | ForEach-Object { (Join-Path $env:ProgramData $_) + '\' }
 
 # Helper windows every GUI process owns; they say nothing about whether an installer is waiting for input.
 $IgnoredWindowClasses = @('IME', 'MSCTFIME UI', 'GDI+ Hook Window Class', 'OleMainThreadWndClass', 'CicMarshalWndClass', 'tooltips_class32',
@@ -2081,10 +2120,6 @@ function Invoke-Monitored
             $windows.Add($parts[1])
             if ($shown -and -not $progress -and ([ProbeWin]::LooksInteractive([int64]$parts[1]) -or $parts[2] -match '^(HwndWrapper|Chrome_WidgetWin|#32770$)')) { $dialogs.Add($parts[1]) }
         }
-        # Every MSI install pauses for about two minutes in Windows Sandbox (software restriction check) with nothing
-        # moving, so while Windows Installer is running a window gets that long before it counts as waiting for a click.
-        $grace = $UiGraceSec
-        if (@($table.Values | Where-Object { $_.Name -eq 'msiexec.exe' }).Count -gt 0) { $grace = [Math]::Max($UiGraceSec, 150) }
         if ($CaptureText)
         {
             foreach ($h in $windows) { foreach ($t in [ProbeWin]::ChildTexts([int64]$h)) { if (-not $texts.Contains($t)) { $texts.Add($t) } } }
@@ -2095,7 +2130,10 @@ function Invoke-Monitored
         {
             $busy = @(@($alive | ForEach-Object { if ($table.ContainsKey($_)) { "$($table[$_].Name)" } }) +
                       @($table.Values | Where-Object { $_.CreationDate -ge $started -and $_.Name -match '^(msiexec|TiWorker|TrustedInstaller)\.exe$' } | ForEach-Object { "$($_.Name)" })) | Select-Object -Unique
-            Write-ProbeLog ("Still running after {0}:{1:00} - {2}; {3}" -f [int][Math]::Floor($now / 60), [int]($now % 60), ($busy -join ', '), $(if ($active) { 'working' } else { "quiet for $([int]$idle)s" }))
+            # What has actually landed on disk: the plainest sign of whether the install is moving.
+            $files = "$([ProbeWin]::NewFilesSince([string[]]$ProgressRoots, [string[]]$ProgressSkip, $started.ToUniversalTime(), 1500))".Split('|')
+            $written = $(if ([int64]$files[0] -gt 0) { "$($files[0])$(if ($files[2]) { '+' }) new files, latest $($files[1])" } else { 'no new files yet' })
+            Write-ProbeLog ("Still running after {0}:{1:00} - {2}; {3}; {4}" -f [int][Math]::Floor($now / 60), [int]($now % 60), ($busy -join ', '), $(if ($active) { 'working' } else { "quiet for $([int]$idle)s" }), $written)
             $nextBeat += 30
         }
 
@@ -2103,7 +2141,7 @@ function Invoke-Monitored
         if ($StopAfterSec -gt 0 -and ($now -ge $StopAfterSec -or ($dialogs.Count -gt 0 -and $idle -ge 4))) { break }
         if ($rootAlive)
         {
-            if ($dialogs.Count -gt 0 -and $idle -ge $grace)
+            if ($dialogs.Count -gt 0 -and $idle -ge $UiGraceSec)
             {
                 # Say what the dialog shows (an error, a licence, a question), not just its title; buttons left out.
                 $current = @($titles | Select-Object -Last 3) -join ' | '
@@ -2122,7 +2160,7 @@ function Invoke-Monitored
             if ($others.Count -eq 0) { break }
             # The installer exited but left children: wait while they work, but an app the installer launched at the end
             # (the program itself, a tray icon) must not hold the run forever.
-            if ((-not $active -and ($now - $rootExit) -ge 20) -or ($now - $rootExit) -ge 300)
+            if ((-not $active -and ($now - $rootExit) -ge 10) -or ($now - $rootExit) -ge 300)
             {
                 $left = @($others | ForEach-Object { if ($table.ContainsKey($_)) { "$($table[$_].Name)" } } | Select-Object -Unique)
                 break
@@ -2206,16 +2244,18 @@ function Get-FootprintSnapshot
     # Names only - enough to diff before/after cheaply.
     $dirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $deep = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Join-Path $SystemProfile 'AppData\Local'), (Join-Path $SystemProfile 'AppData\Roaming'), (Join-Path $SystemProfile 'AppData\Local\Programs'))
+    # .NET calls rather than Get-ChildItem/CIM throughout: the same data, and seconds faster in a freshly started sandbox.
+    $subdirs = { param($p) try { [System.IO.Directory]::GetDirectories($p) } catch { @() } }
     foreach ($root in $deep)
     {
-        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
-        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue))
+        if (-not $root -or -not [System.IO.Directory]::Exists($root)) { continue }
+        foreach ($d in (& $subdirs $root))
         {
-            [void]$dirs.Add($d.FullName)
-            foreach ($d2 in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction SilentlyContinue)) { [void]$dirs.Add($d2.FullName) }
+            [void]$dirs.Add($d)
+            foreach ($d2 in (& $subdirs $d)) { [void]$dirs.Add($d2) }
         }
     }
-    foreach ($d in @(Get-ChildItem -LiteralPath 'C:\' -Directory -Force -ErrorAction SilentlyContinue)) { [void]$dirs.Add($d.FullName) }
+    foreach ($d in (& $subdirs 'C:\')) { [void]$dirs.Add($d) }
 
     $links = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
@@ -2237,10 +2277,23 @@ function Get-FootprintSnapshot
         $k.Close()
     }
 
+    # Win32 services (own or shared process, as Win32_Service lists them; drivers left out), straight from the registry.
     $services = @{}
-    foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Property Name, DisplayName, PathName -ErrorAction SilentlyContinue)) { $services[$s.Name] = $s }
+    $svcKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services')
+    foreach ($n in $svcKey.GetSubKeyNames())
+    {
+        $s = $svcKey.OpenSubKey($n)
+        if (-not $s) { continue }
+        $type = $s.GetValue('Type')
+        if ($type -is [int] -and ($type -band 0x30)) { $services[$n] = [pscustomobject]@{ Name = $n; DisplayName = [string]$s.GetValue('DisplayName'); PathName = [string]$s.GetValue('ImagePath') } }
+        $s.Close()
+    }
+    $svcKey.Close()
+    # Scheduled tasks are files under System32\Tasks named by their path ("\Vendor\Updater"); SYSTEM can read it.
     $tasks = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) { [void]$tasks.Add("$($t.TaskPath)$($t.TaskName)") }
+    $taskRoot = Join-Path $env:SystemRoot 'System32\Tasks'
+    try { foreach ($f in [System.IO.Directory]::GetFiles($taskRoot, '*', [System.IO.SearchOption]::AllDirectories)) { [void]$tasks.Add($f.Substring($taskRoot.Length)) } }
+    catch { foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) { [void]$tasks.Add("$($t.TaskPath)$($t.TaskName)") } }
     return @{ Dirs = $dirs; Links = $links; Keys = $keys; Services = $services; Tasks = $tasks }
 }
 
@@ -2395,18 +2448,6 @@ function Invoke-InstallMode($Cfg)
     $beforeFp      = Get-FootprintSnapshot
     Write-ProbeLog "Baseline: $($beforeEntries.Count) uninstall entries, $($beforeFp.Dirs.Count) folders, $($beforeFp.Services.Count) services"
 
-    if ($Cfg.Help -and $Cfg.Help.FilePath)
-    {
-        Write-ProbeLog "Help probe: $($Cfg.Help.Arguments)"
-        $h = Invoke-Monitored -FilePath $Cfg.Help.FilePath -Arguments $Cfg.Help.Arguments -WorkingDirectory $Cfg.WorkingDirectory -TimeoutSec 30 -StopAfterSec 20 -CaptureText
-        $text = (@($h.StdOut, $h.StdErr, $h.Text) | Where-Object { $_ }) -join "`n"
-        $result.Help = [ordered]@{ Switch = "$($Cfg.Help.Arguments)"; Text = $text; WindowTitles = @($h.WindowTitles); ExitCode = $h.ExitCode }
-        Write-ProbeLog "Help probe captured $($text.Length) chars, windows: $(@($h.WindowTitles) -join ' | ')"
-        $afterHelp = Get-UninstallSnapshot
-        $leak = @($afterHelp.Keys | Where-Object { -not $beforeEntries.ContainsKey($_) })
-        if ($leak.Count -gt 0) { Write-ProbeLog "The help switch installed something ($($leak.Count) new entries); re-baselining"; $beforeEntries = $afterHelp; $beforeFp = Get-FootprintSnapshot }
-    }
-
     $inst = Invoke-Monitored -FilePath $Cfg.FilePath -Arguments $Cfg.Arguments -WorkingDirectory $Cfg.WorkingDirectory -TimeoutSec $Cfg.TimeoutSec -UiGraceSec $Cfg.UiGraceSec -IdleSec $Cfg.IdleSec
     $result.Install = $inst
     Write-ProbeLog "Install finished: exit $($inst.ExitCode), $($inst.DurationSec)s$(if ($inst.Stuck) { ", STUCK: $($inst.Stuck)" })$(if ($inst.TimedOut) { ', TIMED OUT' })"
@@ -2440,6 +2481,16 @@ function Invoke-InstallMode($Cfg)
     $evidence = ($null -ne $primary) -or -not (Test-FootprintEmpty $fp) -or ($result.Detection -and $result.Detection.Detected)
     $result.InstallSucceeded = $silent -and $exitOk -and $evidence
     Write-ProbeLog "Silent: $silent, exit OK: $exitOk, evidence of install: $evidence => succeeded: $($result.InstallSucceeded)"
+
+    # What the installer says about its own switches, for the report. Only needed when this switch set did not work.
+    if (-not $result.InstallSucceeded -and $Cfg.Help -and $Cfg.Help.FilePath)
+    {
+        Write-ProbeLog "Help probe: $($Cfg.Help.Arguments)"
+        $h = Invoke-Monitored -FilePath $Cfg.Help.FilePath -Arguments $Cfg.Help.Arguments -WorkingDirectory $Cfg.WorkingDirectory -TimeoutSec 30 -StopAfterSec 20 -CaptureText
+        $text = (@($h.StdOut, $h.StdErr, $h.Text) | Where-Object { $_ }) -join "`n"
+        $result.Help = [ordered]@{ Switch = "$($Cfg.Help.Arguments)"; Text = $text; WindowTitles = @($h.WindowTitles); ExitCode = $h.ExitCode }
+        Write-ProbeLog "Help probe captured $($text.Length) chars, windows: $(@($h.WindowTitles) -join ' | ')"
+    }
 
     # Prove the registered uninstall while there is a machine with the app on it.
     if ($result.InstallSucceeded -and $primary -and ($primary.QuietUninstallString -or $primary.UninstallString))
@@ -2529,12 +2580,35 @@ function Invoke-ValidateMode($Cfg)
     Copy-Item -Path (Join-Path $env:SystemRoot 'Logs\Software\*') -Destination $logs -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+function Disable-SmartAppControl
+{
+    # Windows Sandbox starts with Smart App Control in evaluation mode but Microsoft Defender's engine disabled. Every MSI
+    # install then asks Defender about the package (msiexec -> wldp -> MpClient -> Defender's RPC endpoint), gets no
+    # answer and retries with backoff for 120 s before carrying on (traced with ETW). Real devices either run Defender,
+    # which answers at once, or have Smart App Control off (managed devices), so it is switched off here.
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
+    $state = (Get-ItemProperty -LiteralPath $key -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+    if ($null -eq $state -or $state -eq 0) { return }
+    try
+    {
+        Set-ItemProperty -LiteralPath $key -Name VerifiedAndReputablePolicyState -Value 0 -Type DWord -ErrorAction Stop
+        $ciTool = Join-Path $env:SystemRoot 'System32\CiTool.exe'
+        if (Test-Path -LiteralPath $ciTool) { [void](cmd.exe /c "`"$ciTool`" --refresh < NUL 2>&1") }
+        Write-ProbeLog "Smart App Control switched off in the sandbox (was $state): Defender does not run here, so each MSI would wait 2 minutes for it."
+    }
+    catch
+    {
+        Write-ProbeLog "Could not switch off Smart App Control ($($_.Exception.Message)); each MSI may pause for 2 minutes."
+    }
+}
+
 try
 {
     $cfg = Get-Content -LiteralPath (Join-Path $probeDir 'config.json') -Raw | ConvertFrom-Json
     $result.Mode  = "$($cfg.Mode)"
     $result.Label = "$($cfg.Label)"
     Write-ProbeLog "Probe started as $(whoami) - mode $($cfg.Mode)$(if ($cfg.Label) { ": $($cfg.Label)" })"
+    Disable-SmartAppControl
     if ($cfg.Mode -eq 'Validate') { Invoke-ValidateMode $cfg } else { Invoke-InstallMode $cfg }
 }
 catch
@@ -3004,9 +3078,9 @@ function Invoke-SandboxProbe
         [string]$UninstallArgs,
         [string]$AppNameHint,
         [int[]]$SuccessCodes = @(0, 3010, 1641),
-        [int]$TimeoutMinutes = 30,          # backstop only; hangs are caught by the idle rules (each MSI in a sandbox costs ~2 min)
+        [int]$TimeoutMinutes = 30,          # backstop only; hangs are caught by the idle rules
         [int]$UiGraceSeconds = 30,
-        [int]$IdleSeconds = 300,             # a windowless pause this long counts as hung (first MSI in a fresh sandbox can stall ~2 min on trust checks)
+        [int]$IdleSeconds = 120,             # a windowless pause this long counts as hung
         [string]$HelpSwitch = '/?',
         [bool]$Network = $true,
         [scriptblock]$OnAttempt              # called as (attempt number, total, candidate) before each sandbox run
@@ -3107,7 +3181,7 @@ function Invoke-SandboxValidation
         DeployMode       = $DeployMode
         TimeoutSec       = $TimeoutMinutes * 60
         UiGraceSec       = 60
-        IdleSec          = 300
+        IdleSec          = 120
         SuccessCodes     = @($SuccessCodes)
     }
     Write-PackagerLog 'Validating the package in a fresh sandbox (install, detect, uninstall, detect) as SYSTEM'

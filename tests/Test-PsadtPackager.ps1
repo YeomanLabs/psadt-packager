@@ -56,6 +56,25 @@ Assert-Equal (Get-CleanAppName -Name ('Microsoft' + [char]0x00AE + ' Windows' + 
 Assert-Equal (Get-CleanAppName -Name ('Pr' + [char]0x00E2 + 'ce Viewer')) ('Pr' + [char]0x00E2 + 'ce Viewer') 'clean name: accented letters kept'
 # Windows PowerShell 5.1 reads a file without a BOM as ANSI, so the script must stay pure ASCII.
 Assert-True (-not ([System.IO.File]::ReadAllText($ScriptPath) -match '[^\x00-\x7F]')) 'PsadtPackager.ps1 is pure ASCII'
+
+# ---- Scripts that only ever run inside Windows Sandbox: a mistake there would only show up in a sandbox run.
+Assert-Parses $script:SandboxProbeScript 'sandbox probe script (Run-Probe.ps1)'
+Assert-Parses $script:ClassicSandboxBootstrap 'classic sandbox logon script (Start-Classic.ps1)'
+$probeCs = [regex]::Match($script:SandboxProbeScript, '(?s)Add-Type -TypeDefinition @"\r?\n(.*?)\r?\n"@')
+Assert-True $probeCs.Success 'probe script carries its C# helper'
+$compiled = $true
+try { Add-Type -TypeDefinition $probeCs.Groups[1].Value -ErrorAction Stop } catch { $compiled = $false; Write-Host "    $($_.Exception.Message)" }
+Assert-True $compiled 'probe C# helper compiles'
+if ($compiled)
+{
+    $since = (Get-Date).ToUniversalTime()
+    $fdir = Join-Path ([System.IO.Path]::GetTempPath()) ('psadt-newfiles-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+    New-Item -ItemType Directory -Path "$fdir\App\bin", "$fdir\Skip\x" -Force | Out-Null
+    'a' | Set-Content "$fdir\App\bin\new.dll"; 'b' | Set-Content "$fdir\Skip\x\noise.log"
+    $nf = "$([ProbeWin]::NewFilesSince([string[]]@($fdir), [string[]]@("$fdir\Skip\"), $since.AddSeconds(-1), 2000))".Split('|')
+    Assert-Equal "$($nf[0])|$(Split-Path $nf[1] -Leaf)|$($nf[2])" '1|new.dll|' 'progress: counts new files, skips the noisy folder'
+    Remove-Item -LiteralPath $fdir -Recurse -Force -ErrorAction SilentlyContinue
+}
 $split = Split-NameAndVersion 'Contoso Agent 2.1.0'; Assert-Equal "$($split.Name)|$($split.Version)" 'Contoso Agent|2.1.0' 'split: spaces'
 $split = Split-NameAndVersion 'contoso_agent_v2.1';  Assert-Equal "$($split.Name)|$($split.Version)" 'contoso agent|2.1' 'split: underscores and v'
 $split = Split-NameAndVersion 'npp.8.9.8.1.Installer.x64'; Assert-Equal "$($split.Name)|$($split.Version)" 'npp|8.9.8.1' 'split: dotted file name'
