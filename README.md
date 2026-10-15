@@ -74,6 +74,8 @@ Then, for installers and scripts:
 4. **Build** the package and `.intunewin` (IntuneWinAppUtil.exe is downloaded if needed).
 5. **Test the package** in a fresh sandbox as SYSTEM: install, detection, uninstall, detection again. Anything left behind after the uninstall is listed.
 
+In the GUI the tabs fill in as soon as the file has been read and again as the sandbox learns more. The drop card on the Application tab shows the current step, an elapsed timer and finally the result (green when validated) with an *Open report* button; the taskbar button shows progress too, and the log gets a "still running" line every 30 seconds during long installs.
+
 `AutoPackage-Report.md` shows each setting, how it was determined, the sandbox attempts and the end-to-end result. Status is **Validated** (all four steps passed), **Built** (not tested end to end) or **Needs attention** (no silent switches found, the test failed, or a per-user installer that lands in the SYSTEM profile). Headless exit codes: 0 validated or built, 2 needs attention, 1 error. `-NoSandbox` packages from the file alone; `-SkipValidation` skips step 5.
 
 MSI and MSIX are fully described by the file, so they skip step 2 and go straight to the end-to-end test.

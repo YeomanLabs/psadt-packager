@@ -94,6 +94,27 @@ param
     [string]$ClientId
 )
 
+# Windows PowerShell started from a PowerShell 7 session (other than by pwsh itself, which cleans this up) inherits
+# PowerShell 7's module folders, and then every module import fails with "Error in TypeData ... is already present".
+# Restart once with the module path a process started from Explorer gets, passing the same arguments and exit code.
+if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUNCHED)
+{
+    $foreignModules = @("$env:PSModulePath" -split ';' | Where-Object { $_ -and $_ -notmatch 'WindowsPowerShell' -and ($_ -match '\\PowerShell\\' -or $_ -match 'microsoft\.powershell_') })
+    if ($foreignModules.Count -gt 0)
+    {
+        $env:PSADT_PACKAGER_RELAUNCHED = '1'
+        $env:PSModulePath = (@([Environment]::GetEnvironmentVariable('PSModulePath', 'Machine'), [Environment]::GetEnvironmentVariable('PSModulePath', 'User')) | Where-Object { $_ }) -join ';'
+        $relaunch = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+        foreach ($kv in $PSBoundParameters.GetEnumerator())
+        {
+            if ($kv.Value -is [System.Management.Automation.SwitchParameter]) { if ($kv.Value.IsPresent) { $relaunch += "-$($kv.Key)" } }
+            else { $relaunch += "-$($kv.Key)"; $relaunch += ('"{0}"' -f $kv.Value) }
+        }
+        $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $relaunch -NoNewWindow -Wait -PassThru
+        exit $child.ExitCode
+    }
+}
+
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
@@ -1908,6 +1929,7 @@ function Invoke-Monitored
     $rootExit = $null
     $left     = @()
     $last     = 0.0
+    $nextBeat = 30
     while ($true)
     {
         Start-Sleep -Milliseconds 2000
@@ -1967,6 +1989,15 @@ function Invoke-Monitored
         if ($CaptureText)
         {
             foreach ($h in $windows) { foreach ($t in [ProbeWin]::ChildTexts([int64]$h)) { if (-not $texts.Contains($t)) { $texts.Add($t) } } }
+        }
+
+        # A heartbeat for long installs, so the packager's log shows the run is alive and what it is doing.
+        if ($StopAfterSec -eq 0 -and $now -ge $nextBeat)
+        {
+            $busy = @(@($alive | ForEach-Object { if ($table.ContainsKey($_)) { "$($table[$_].Name)" } }) +
+                      @($table.Values | Where-Object { $_.CreationDate -ge $started -and $_.Name -match '^(msiexec|TiWorker|TrustedInstaller)\.exe$' } | ForEach-Object { "$($_.Name)" })) | Select-Object -Unique
+            Write-ProbeLog ("Still running after {0}:{1:00} - {2}; {3}" -f [int][Math]::Floor($now / 60), [int]($now % 60), ($busy -join ', '), $(if ($active) { 'working' } else { "quiet for $([int]$idle)s" }))
+            $nextBeat += 30
         }
 
         $rootAlive = -not $p.HasExited
@@ -2489,13 +2520,30 @@ function Start-PackagerSandbox
     $running = @(Get-RunningSandboxIds)
     if ($running.Count -gt 0)
     {
-        # One we started earlier and never stopped (packager closed mid-run) can go; anything else belongs to the user.
-        $known = @()
-        if (Test-Path -LiteralPath $ours) { $known = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue) }
+        # running.txt lists the sandboxes the packager started as "id|owner process id". One whose owner has exited
+        # (packager closed mid-run) is left over and can go; one whose owner is still running belongs to another
+        # packager window; anything not listed belongs to the user.
+        $known = @{}
+        if (Test-Path -LiteralPath $ours)
+        {
+            foreach ($line in @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ }))
+            {
+                $parts = $line.Split('|')
+                $owner = 0
+                if ($parts.Count -gt 1) { [void][int]::TryParse($parts[1], [ref]$owner) }
+                $known[$parts[0]] = $owner
+            }
+        }
         foreach ($id in $running)
         {
-            if ($known -contains $id) { Write-PackagerLog "Stopping a sandbox left over from an earlier run ($id)"; [void](Invoke-Wsb -Arguments @('stop', '--id', $id) -TimeoutSec 60) }
-            else { throw 'A Windows Sandbox is already running. Only one can run at a time - close it and try again.' }
+            if (-not $known.ContainsKey($id)) { throw 'A Windows Sandbox is already running. Only one can run at a time - close it and try again.' }
+            $owner = $known[$id]
+            if ($owner -and $owner -ne $PID -and (Get-Process -Id $owner -ErrorAction SilentlyContinue))
+            {
+                throw 'Another PSADT Packager window is using Windows Sandbox right now, and only one sandbox can run at a time. Wait for it to finish and try again.'
+            }
+            Write-PackagerLog "Stopping a sandbox left over from an earlier run ($id)"
+            [void](Invoke-Wsb -Arguments @('stop', '--id', $id) -TimeoutSec 60)
         }
     }
     $esc = { param($t) [System.Security.SecurityElement]::Escape("$t") }
@@ -2512,7 +2560,7 @@ function Start-PackagerSandbox
     if (-not $id) { throw "Windows Sandbox did not start: $($r.Output)" }
     $dir = Split-Path -Path $ours -Parent
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Add-Content -LiteralPath $ours -Value $id
+    Add-Content -LiteralPath $ours -Value "$id|$PID"
     return $id
 }
 
@@ -2524,7 +2572,7 @@ function Stop-PackagerSandbox
     $ours = Join-Path $script:AppDataDir 'Sandbox\running.txt'
     if (Test-Path -LiteralPath $ours)
     {
-        $keep = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ -and $_ -ne $Id })
+        $keep = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Split('|')[0] -ne $Id })
         Set-Content -LiteralPath $ours -Value $keep
     }
 }
@@ -2610,7 +2658,8 @@ function Invoke-SandboxProbe
         [int]$UiGraceSeconds = 30,
         [int]$IdleSeconds = 300,             # a windowless pause this long counts as hung (first MSI in a fresh sandbox can stall ~2 min on trust checks)
         [string]$HelpSwitch = '/?',
-        [bool]$Network = $true
+        [bool]$Network = $true,
+        [scriptblock]$OnAttempt              # called as (attempt number, total, candidate) before each sandbox run
     )
     if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox (with its wsb command-line tool) is not available on this PC.' }
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw "Installer not found: $InstallerPath" }
@@ -2647,6 +2696,7 @@ function Invoke-SandboxProbe
             DetectionScriptBase64 = $(if ($DetectionScript) { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($DetectionScript)) } else { '' })
         }
         Write-PackagerLog "Sandbox $n of $($Candidates.Count): $rel $candidate"
+        if ($OnAttempt) { & $OnAttempt $n $Candidates.Count $candidate }
         $r = Invoke-SandboxRun -SourceRoot $SourceRoot -RunDir (Join-Path $runRoot "attempt-$n") -Config $config -TimeoutSec ($TimeoutMinutes * 60 * 2 + 300) -Network $Network
         if (-not $r)
         {
@@ -3403,11 +3453,15 @@ function Invoke-AutoPackage
         [switch]$SkipValidation,
         [switch]$Force,
         [int]$MaxAttempts = 4,
-        [scriptblock]$ConfirmOverwrite
+        [scriptblock]$ConfirmOverwrite,
+        [scriptblock]$OnProgress            # called as (stage, message, definition or $null, installer info) at each step
     )
     $warnings = New-Object System.Collections.Generic.List[string]
     $notes    = New-Object System.Collections.Generic.List[string]
+    $info     = $null
+    $progress = { param($Stage, $Message, $Definition) if ($OnProgress) { & $OnProgress $Stage $Message $Definition $info } }
     $Path = (Resolve-Path -LiteralPath $Path).Path
+    & $progress 'Reading' "Reading $(Split-Path -Path $Path -Leaf)..." $null
     $in = Resolve-PackageInput -Path $Path
     foreach ($n in @($in.Notes)) { $notes.Add($n) }
     Write-PackagerLog "Auto-package: $($in.Kind) $($in.Entry)"
@@ -3438,7 +3492,6 @@ function Invoke-AutoPackage
     if ($tool) { $def.Output.IntuneWinAppUtil = $tool; $def.Output.BuildIntuneWin = $true } else { $def.Output.BuildIntuneWin = $false }
 
     # 1. What the file itself says.
-    $info = $null
     if ($in.Kind -eq 'Portable')
     {
         [void](Set-DefinitionForPortable -Def $def -PackageInput $in)
@@ -3463,6 +3516,16 @@ function Invoke-AutoPackage
         if ($in.Kind -eq 'Script' -or -not "$($def.App.Name)".Trim()) { $def.App.Name = Get-CleanAppName -Name $split.Name -Version $split.Version }
         if (-not "$($def.App.Version)".Trim() -and $split.Version) { $def.App.Version = $split.Version }
     }
+    $what = "$("$($def.App.Name) $($def.App.Version)".Trim())"
+    $next = switch ($in.Kind)
+    {
+        'EXE'      { "Read the installer: $what ($($script:SilentPresets[$info.Engine].Label)). Next: find its silent switches in Windows Sandbox." }
+        'MSI'      { "Read the MSI: $what. An MSI describes itself, so there are no switches to discover. Next: build and test it." }
+        'MSIX'     { "Read the package: $what. Next: build and test it." }
+        'Script'   { "Read the script: $what. Next: run it in Windows Sandbox to see what it installs." }
+        'Portable' { "No installer, so $what will be copied to Program Files with a Start menu shortcut. Next: build and test it." }
+    }
+    & $progress 'Read' $next $def
 
     # 2. What running it shows (installers and scripts; MSI and MSIX are fully described by the file).
     $probe = @(); $win = $null
@@ -3486,11 +3549,18 @@ function Invoke-AutoPackage
             $help       = ''
         }
         $success = @(@($def.Install.SuccessExitCodes) + @($def.Install.RebootExitCodes) | ForEach-Object { [int]$_ })
-        $probe = @(Invoke-SandboxProbe -InstallerPath $in.Entry -SourceRoot $in.Root -CopyWholeSource:$in.IsFolder -Candidates $candidates -DetectionScript $detGuess -UninstallArgs $uArgs -AppNameHint $def.App.Name -SuccessCodes $success -HelpSwitch $help)
+        $entryLeaf = Split-Path -Path $in.Entry -Leaf
+        $onAttempt = {
+            param($Number, $Total, $Candidate)
+            if ($in.Kind -eq 'Script') { & $progress 'Probing' "Running $entryLeaf as SYSTEM in Windows Sandbox to see what it creates..." $null }
+            else { & $progress 'Probing' "Sandbox attempt $Number of ${Total}: running $entryLeaf $Candidate as SYSTEM. Installers that contain MSIs pause about 2 minutes per MSI in the sandbox." $null }
+        }
+        $probe = @(Invoke-SandboxProbe -InstallerPath $in.Entry -SourceRoot $in.Root -CopyWholeSource:$in.IsFolder -Candidates $candidates -DetectionScript $detGuess -UninstallArgs $uArgs -AppNameHint $def.App.Name -SuccessCodes $success -HelpSwitch $help -OnAttempt $onAttempt)
         $win = @($probe | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
         if ($win)
         {
             [void](Set-DefinitionFromProbe -Def $def -Result $win -Auto -NameHint $in.NameHint)
+            & $progress 'Probed' $(if ($in.Kind -eq 'Script') { 'The script ran cleanly. Detection and uninstall were worked out from what it created.' } else { "Installs silently with '$($win.Candidate)'. Uninstall and detection were worked out from what it created." }) $def
             $perUser = @($win.Footprint.PerUser) + @($win.NewEntries | Where-Object { $_.Location -like 'CurrentUser*' } | ForEach-Object { "uninstall entry $($_.DisplayName) in HKCU" })
             if (@($perUser | Where-Object { $_ }).Count -gt 0)
             {
@@ -3533,6 +3603,7 @@ function Invoke-AutoPackage
         if ($ConfirmOverwrite -and (& $ConfirmOverwrite $paths.Root)) { $overwrite = $true }
         else { throw "A package already exists at $($paths.Root). Use -Force (or confirm) to rebuild it." }
     }
+    & $progress 'Building' 'Building the PSADT package and .intunewin...' $null
     $root = Invoke-PackageBuild -Def $def -Force:$overwrite
     $context.PackageRoot = $root
 
@@ -3543,6 +3614,7 @@ function Invoke-AutoPackage
     else
     {
         $codes = @(@($def.Install.SuccessExitCodes) + @($def.Install.RebootExitCodes) | ForEach-Object { [int]$_ })
+        & $progress 'Validating' 'Testing the finished package in a fresh Windows Sandbox as SYSTEM: install, detect, uninstall, detect again...' $null
         $context.Validation = Invoke-SandboxValidation -PackageRoot $root -DetectName $paths.DetectName -SuccessCodes $codes
         if (-not $context.Validation) { $context.ValidationNote = 'The sandbox returned no result; see the run folder under %LOCALAPPDATA%\PsadtPackager\Sandbox.' }
         elseif ($context.Validation.Error -and -not $context.Validation.Validation) { $context.ValidationNote = "The sandbox reported: $($context.Validation.Error)" }
@@ -4270,430 +4342,890 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="PSADT Packager" Width="1080" Height="840" MinWidth="960" MinHeight="720" AllowDrop="True"
-        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="12" Background="#F3F3F3">
+        Title="PSADT Packager" Width="1120" Height="900" MinWidth="980" MinHeight="760" AllowDrop="True"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        Background="#F3F3F3" Foreground="#1B1B1B" UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display">
   <Window.Resources>
+    <!-- Palette: YeomanLabs navy for primary actions and focus, coral for the selected tab and progress. -->
+    <SolidColorBrush x:Key="Navy" Color="#041635"/>
+    <SolidColorBrush x:Key="NavyHover" Color="#13305E"/>
+    <SolidColorBrush x:Key="Focus" Color="#2A5BA0"/>
+    <SolidColorBrush x:Key="Coral" Color="#FF6950"/>
+    <SolidColorBrush x:Key="Line" Color="#E3E3E3"/>
+    <SolidColorBrush x:Key="ControlLine" Color="#CFCFCF"/>
+    <SolidColorBrush x:Key="Subtle" Color="#5F5F5F"/>
+
     <Style TargetType="Label">
       <Setter Property="Margin" Value="0,2,8,2"/>
       <Setter Property="VerticalAlignment" Value="Top"/>
-      <Setter Property="Padding" Value="0,5,0,0"/>
+      <Setter Property="Padding" Value="0,6,0,0"/>
+      <Setter Property="Foreground" Value="#3A3A3A"/>
     </Style>
+
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="Foreground" Value="#1B1B1B"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLine}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="14,6"/>
+      <Setter Property="Margin" Value="6,3,0,3"/>
+      <Setter Property="MinWidth" Value="96"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter Property="Background" Value="#F7F7F7"/>
+          <Setter Property="BorderBrush" Value="#B4B4B4"/>
+        </Trigger>
+        <Trigger Property="IsPressed" Value="True">
+          <Setter Property="Background" Value="#ECECEC"/>
+        </Trigger>
+        <Trigger Property="IsKeyboardFocused" Value="True">
+          <Setter Property="BorderBrush" Value="{StaticResource Focus}"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+
+    <Style x:Key="Primary" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="{StaticResource Navy}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Navy}"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter Property="Background" Value="{StaticResource NavyHover}"/>
+          <Setter Property="BorderBrush" Value="{StaticResource NavyHover}"/>
+        </Trigger>
+        <Trigger Property="IsPressed" Value="True">
+          <Setter Property="Background" Value="#020B1C"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+
     <Style TargetType="TextBox">
       <Setter Property="Margin" Value="0,3,0,3"/>
-      <Setter Property="Padding" Value="3"/>
+      <Setter Property="Padding" Value="6,4"/>
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLine}"/>
+      <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5">
+              <ScrollViewer x:Name="PART_ContentHost" Focusable="False"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#A8A8A8"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Focus}"/>
+                <Setter TargetName="Bd" Property="BorderThickness" Value="1,1,1,2"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Bd" Property="Background" Value="#F6F6F6"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#E2E2E2"/>
+                <Setter Property="Foreground" Value="#9A9A9A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
-    <Style TargetType="ComboBox">
-      <Setter Property="Margin" Value="0,3,0,3"/>
-      <Setter Property="Padding" Value="4,3"/>
-    </Style>
-    <Style TargetType="CheckBox">
-      <Setter Property="Margin" Value="0,6,14,4"/>
-      <Setter Property="VerticalAlignment" Value="Center"/>
-    </Style>
-    <Style TargetType="Button">
-      <Setter Property="Margin" Value="6,3,0,3"/>
-      <Setter Property="Padding" Value="12,4"/>
-      <Setter Property="MinWidth" Value="96"/>
-    </Style>
-    <Style x:Key="Code" TargetType="TextBox">
-      <Setter Property="FontFamily" Value="Consolas"/>
+
+    <Style x:Key="Code" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+      <Setter Property="FontFamily" Value="Cascadia Mono, Consolas"/>
       <Setter Property="FontSize" Value="12"/>
       <Setter Property="AcceptsReturn" Value="True"/>
       <Setter Property="AcceptsTab" Value="True"/>
       <Setter Property="VerticalScrollBarVisibility" Value="Auto"/>
       <Setter Property="HorizontalScrollBarVisibility" Value="Auto"/>
       <Setter Property="TextWrapping" Value="NoWrap"/>
-      <Setter Property="Margin" Value="0,3,0,3"/>
-      <Setter Property="Padding" Value="3"/>
+      <Setter Property="Padding" Value="6,5"/>
       <Setter Property="VerticalContentAlignment" Value="Top"/>
     </Style>
+
+    <!-- ComboBox: one template for both the drop-down list and the editable kind. -->
+    <ControlTemplate x:Key="ComboToggle" TargetType="ToggleButton">
+      <Border x:Name="Bd" Background="White" BorderBrush="{StaticResource ControlLine}" BorderThickness="1" CornerRadius="5">
+        <Path x:Name="Arrow" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,11,0"
+              Data="M 0 0 L 4.5 4.5 L 9 0" Stroke="#5F5F5F" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+      </Border>
+      <ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter TargetName="Bd" Property="BorderBrush" Value="#A8A8A8"/>
+        </Trigger>
+        <Trigger Property="IsChecked" Value="True">
+          <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Focus}"/>
+        </Trigger>
+        <Trigger Property="IsEnabled" Value="False">
+          <Setter TargetName="Bd" Property="Background" Value="#F6F6F6"/>
+          <Setter TargetName="Bd" Property="BorderBrush" Value="#E2E2E2"/>
+          <Setter TargetName="Arrow" Property="Stroke" Value="#B5B5B5"/>
+        </Trigger>
+      </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <Style TargetType="ComboBox">
+      <Setter Property="Margin" Value="0,3,0,3"/>
+      <Setter Property="Padding" Value="8,5,30,5"/>
+      <Setter Property="MinHeight" Value="29"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <ToggleButton x:Name="Toggle" Template="{StaticResource ComboToggle}" Focusable="False" ClickMode="Press"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"/>
+              <ContentPresenter x:Name="Selected" IsHitTestVisible="False" Margin="{TemplateBinding Padding}"
+                                VerticalAlignment="Center" HorizontalAlignment="Left"
+                                Content="{TemplateBinding SelectionBoxItem}"
+                                ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"/>
+              <TextBox x:Name="PART_EditableTextBox" Style="{x:Null}" Visibility="Hidden" Margin="2,2,28,2" Padding="5,3"
+                       VerticalContentAlignment="Center" Background="Transparent" BorderThickness="0"
+                       IsReadOnly="{Binding IsReadOnly, RelativeSource={RelativeSource TemplatedParent}}"/>
+              <Popup x:Name="PART_Popup" Placement="Bottom" AllowsTransparency="True" Focusable="False" PopupAnimation="Slide"
+                     IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <Border Background="White" BorderBrush="#D6D6D6" BorderThickness="1" CornerRadius="6" Margin="0,4,0,0" Padding="3"
+                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                        MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                  <ScrollViewer>
+                    <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsEditable" Value="True">
+                <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="Selected" Property="Visibility" Value="Hidden"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="#9A9A9A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="Padding" Value="8,5"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#F1F1F1"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#E5ECF6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="CheckBox">
+      <Setter Property="Margin" Value="0,7,18,4"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <StackPanel Orientation="Horizontal" Background="Transparent">
+              <Border x:Name="Box" Width="18" Height="18" CornerRadius="4" BorderBrush="#8A8A8A" BorderThickness="1" Background="White" VerticalAlignment="Center">
+                <Path x:Name="Mark" Data="M 3.5 9 L 7.3 12.6 L 14 5.4" Stroke="White" StrokeThickness="2"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Visibility="Collapsed"/>
+              </Border>
+              <ContentPresenter Margin="8,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Box" Property="BorderBrush" Value="{StaticResource Focus}"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Box" Property="Background" Value="{StaticResource Navy}"/>
+                <Setter TargetName="Box" Property="BorderBrush" Value="{StaticResource Navy}"/>
+                <Setter TargetName="Mark" Property="Visibility" Value="Visible"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ListBox">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLine}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBox">
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="3">
+              <ScrollViewer Focusable="False">
+                <ItemsPresenter/>
+              </ScrollViewer>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ListBoxItem">
+      <Setter Property="Padding" Value="8,4"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#F3F3F3"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#E5ECF6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- Thin scroll bars. -->
+    <Style x:Key="ScrollThumb" TargetType="Thumb">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Thumb">
+            <Border x:Name="T" Background="#BDBDBD" CornerRadius="3"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="T" Property="Background" Value="#959595"/>
+              </Trigger>
+              <Trigger Property="IsDragging" Value="True">
+                <Setter TargetName="T" Property="Background" Value="#7A7A7A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="ScrollPage" TargetType="RepeatButton">
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="IsTabStop" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RepeatButton">
+            <Border Background="Transparent"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Width" Value="10"/>
+      <Setter Property="MinWidth" Value="10"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageUpCommand"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Style="{StaticResource ScrollThumb}" Margin="2,2"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageDownCommand"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="Width" Value="Auto"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="Height" Value="10"/>
+          <Setter Property="MinHeight" Value="10"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ScrollBar">
+                <Grid Background="Transparent">
+                  <Track x:Name="PART_Track" IsDirectionReversed="False">
+                    <Track.DecreaseRepeatButton>
+                      <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageLeftCommand"/>
+                    </Track.DecreaseRepeatButton>
+                    <Track.Thumb>
+                      <Thumb Style="{StaticResource ScrollThumb}" Margin="2,2"/>
+                    </Track.Thumb>
+                    <Track.IncreaseRepeatButton>
+                      <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageRightCommand"/>
+                    </Track.IncreaseRepeatButton>
+                  </Track>
+                </Grid>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+
+    <!-- Tabs: plain text with a coral bar under the selected one. -->
+    <Style TargetType="TabControl">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabControl">
+            <DockPanel>
+              <Border DockPanel.Dock="Top" BorderBrush="#DEDEDE" BorderThickness="0,0,0,1" Margin="0,0,0,14">
+                <TabPanel IsItemsHost="True" Background="Transparent"/>
+              </Border>
+              <ContentPresenter ContentSource="SelectedContent"/>
+            </DockPanel>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="TabItem">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Grid Background="Transparent" Margin="0,0,2,0">
+              <ContentPresenter x:Name="Hdr" ContentSource="Header" Margin="14,8,14,11" TextElement.Foreground="#5F5F5F"/>
+              <Border x:Name="Bar" Height="3" CornerRadius="1.5" Background="{StaticResource Coral}" VerticalAlignment="Bottom" Margin="14,0,14,-1" Visibility="Hidden"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Hdr" Property="TextElement.Foreground" Value="#1B1B1B"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bar" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="Hdr" Property="TextElement.Foreground" Value="#1B1B1B"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="22,18"/>
+    </Style>
+
+    <Style TargetType="ProgressBar">
+      <Setter Property="Height" Value="4"/>
+      <Setter Property="Foreground" Value="{StaticResource Coral}"/>
+      <Setter Property="Background" Value="#E9E9E9"/>
+      <Setter Property="BorderThickness" Value="0"/>
+    </Style>
+
+    <Style TargetType="GridSplitter">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="GridSplitter">
+            <Grid Background="Transparent">
+              <Border Width="44" Height="4" CornerRadius="2" Background="#CACACA" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <Style x:Key="Hint" TargetType="TextBlock">
-      <Setter Property="Foreground" Value="#5A5A5A"/>
+      <Setter Property="Foreground" Value="{StaticResource Subtle}"/>
       <Setter Property="TextWrapping" Value="Wrap"/>
-      <Setter Property="Margin" Value="0,0,0,8"/>
+      <Setter Property="Margin" Value="0,0,0,10"/>
+      <Setter Property="LineHeight" Value="18"/>
     </Style>
     <Style x:Key="Section" TargetType="TextBlock">
       <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontSize" Value="14"/>
       <Setter Property="Margin" Value="0,4,0,4"/>
     </Style>
   </Window.Resources>
+
   <DockPanel>
-    <Menu DockPanel.Dock="Top">
-      <MenuItem Header="_File">
-        <MenuItem Name="MenuNew" Header="_New definition"/>
-        <MenuItem Name="MenuOpen" Header="_Open definition..."/>
-        <MenuItem Name="MenuSave" Header="_Save definition"/>
-        <MenuItem Name="MenuSaveAs" Header="Save definition _as..."/>
-        <Separator/>
-        <MenuItem Name="MenuExit" Header="E_xit"/>
-      </MenuItem>
-      <MenuItem Header="_Help">
-        <MenuItem Name="MenuAbout" Header="_About"/>
-      </MenuItem>
-    </Menu>
-    <StatusBar DockPanel.Dock="Bottom">
-      <TextBlock Name="StatusText" Text="Ready"/>
-    </StatusBar>
-    <Grid Margin="8">
+    <!-- Header -->
+    <Border DockPanel.Dock="Top" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="22,12,14,12">
+      <DockPanel>
+        <Menu DockPanel.Dock="Right" VerticalAlignment="Center" Background="Transparent" FontSize="13">
+          <MenuItem Header="_File" Padding="10,5">
+            <MenuItem Name="MenuNew" Header="_New definition"/>
+            <MenuItem Name="MenuOpen" Header="_Open definition..."/>
+            <MenuItem Name="MenuSave" Header="_Save definition"/>
+            <MenuItem Name="MenuSaveAs" Header="Save definition _as..."/>
+            <Separator/>
+            <MenuItem Name="MenuExit" Header="E_xit"/>
+          </MenuItem>
+          <MenuItem Header="_Help" Padding="10,5">
+            <MenuItem Name="MenuAbout" Header="_About"/>
+          </MenuItem>
+        </Menu>
+        <Viewbox Width="36" Height="36" Margin="0,0,14,0" VerticalAlignment="Center">
+          <Canvas Width="256" Height="256">
+            <Rectangle Width="240" Height="240" Canvas.Left="8" Canvas.Top="8" RadiusX="52" RadiusY="52" Fill="{StaticResource Navy}"/>
+            <Path Stroke="White" StrokeThickness="18" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                  Data="M 56 128 L 56 204 L 200 204 L 200 128 M 40 128 L 92 128 M 164 128 L 216 128"/>
+            <Path Fill="{StaticResource Coral}" Data="M 110 40 L 146 40 L 146 112 L 178 112 L 128 168 L 78 112 L 110 112 Z"/>
+          </Canvas>
+        </Viewbox>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="PSADT Packager" FontSize="17" FontWeight="SemiBold"/>
+          <TextBlock Text="PSAppDeployToolkit packages for Intune, worked out and tested in Windows Sandbox" Foreground="{StaticResource Subtle}" FontSize="12"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- Status bar -->
+    <Border DockPanel.Dock="Bottom" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="22,7,22,7">
+      <DockPanel>
+        <ProgressBar Name="StatusProgress" DockPanel.Dock="Right" Width="180" IsIndeterminate="True" VerticalAlignment="Center" Visibility="Collapsed"/>
+        <TextBlock Name="StatusText" Text="Ready" Foreground="{StaticResource Subtle}" TextTrimming="CharacterEllipsis" Margin="0,0,16,0"/>
+      </DockPanel>
+    </Border>
+
+    <Grid Margin="22,14,22,14">
       <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="150" MinHeight="60"/>
+        <RowDefinition Height="14"/>
+        <RowDefinition Height="160" MinHeight="70"/>
       </Grid.RowDefinitions>
       <TabControl Name="Tabs" Grid.Row="0">
 
-        <TabItem Header="  1. Application  ">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="150"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Drop an installer, script, .zip or folder anywhere on this window (or use Auto-package) and everything is worked out for you: it runs in Windows Sandbox to find the silent switches, uninstall and detection, builds the package and tests it end to end. 'Read metadata' only reads the file and fills the tabs for you to finish by hand."/>
-            <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,12">
-              <Button Name="BtnAutoPackage" Content="Auto-package..." FontWeight="Bold" Margin="0,3,0,3" ToolTip="Pick an installer (.msi, .exe, .msix), script (.ps1, .cmd, .bat, .vbs) or .zip. Folders: drag them onto the window."/>
-              <Button Name="BtnImportInstaller" Content="Read metadata from installer..."/>
-            </StackPanel>
-            <Label Grid.Row="2" Content="Vendor"/>
-            <TextBox Grid.Row="2" Grid.Column="1" Name="AppVendor"/>
-            <Label Grid.Row="3" Content="Application name"/>
-            <TextBox Grid.Row="3" Grid.Column="1" Name="AppName"/>
-            <Label Grid.Row="4" Content="Version"/>
-            <TextBox Grid.Row="4" Grid.Column="1" Name="AppVersion" Width="220" HorizontalAlignment="Left"/>
-            <Label Grid.Row="5" Content="Architecture"/>
-            <ComboBox Grid.Row="5" Grid.Column="1" Name="AppArch" Width="140" HorizontalAlignment="Left" IsEditable="True"/>
-            <Label Grid.Row="6" Content="Language"/>
-            <TextBox Grid.Row="6" Grid.Column="1" Name="AppLang" Width="80" HorizontalAlignment="Left"/>
-            <Label Grid.Row="7" Content="Revision"/>
-            <TextBox Grid.Row="7" Grid.Column="1" Name="AppRevision" Width="80" HorizontalAlignment="Left"/>
-            <Label Grid.Row="8" Content="Script version"/>
-            <TextBox Grid.Row="8" Grid.Column="1" Name="AppScriptVersion" Width="140" HorizontalAlignment="Left"/>
-            <Label Grid.Row="9" Content="Script author"/>
-            <TextBox Grid.Row="9" Grid.Column="1" Name="AppAuthor" Width="300" HorizontalAlignment="Left"/>
-            <TextBlock Grid.Row="10" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,12,0,0"
-                       Text="The output folder is named Vendor_Name_Version. Vendor, name and version also drive the PSADT dialog titles and log file names."/>
-          </Grid>
-        </TabItem>
-
-        <TabItem Header="  2. Source files  ">
-          <Grid Margin="12">
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Style="{StaticResource Hint}"
-                       Text="Everything listed here is copied into the package. Files\ is for the installer, transforms, patches and scripts the deployment runs. SupportFiles\ is for anything else (config files, licences, fonts). 'Add folder contents' copies the files inside a folder; 'Add folder' copies the folder itself."/>
-            <DockPanel Grid.Row="1">
-              <TextBlock Style="{StaticResource Section}" Text="Files\" VerticalAlignment="Center"/>
-              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Name="BtnFilesAdd" Content="Add files..."/>
-                <Button Name="BtnFilesAddFolder" Content="Add folder..."/>
-                <Button Name="BtnFilesAddContents" Content="Add folder contents..."/>
-                <Button Name="BtnFilesRemove" Content="Remove selected"/>
-              </StackPanel>
-            </DockPanel>
-            <ListBox Grid.Row="2" Name="FilesList" SelectionMode="Extended" FontFamily="Consolas" Margin="0,2,0,10"/>
-            <DockPanel Grid.Row="3">
-              <TextBlock Style="{StaticResource Section}" Text="SupportFiles\" VerticalAlignment="Center"/>
-              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Name="BtnSupportAdd" Content="Add files..."/>
-                <Button Name="BtnSupportAddFolder" Content="Add folder..."/>
-                <Button Name="BtnSupportAddContents" Content="Add folder contents..."/>
-                <Button Name="BtnSupportRemove" Content="Remove selected"/>
-              </StackPanel>
-            </DockPanel>
-            <ListBox Grid.Row="5" Name="SupportList" SelectionMode="Extended" FontFamily="Consolas" Margin="0,2,0,0"/>
-          </Grid>
-        </TabItem>
-
-        <TabItem Header="  3. Install  ">
+        <TabItem Header="Application">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <Grid Margin="12">
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="170"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              </Grid.RowDefinitions>
-              <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                         Text="Defines the Install phase of Invoke-AppDeployToolkit.ps1 (Repair re-uses it). Pre/post PowerShell runs inside the toolkit session, so every *-ADT* function and $adtSession are available."/>
-              <Label Grid.Row="1" Content="Install type"/>
-              <ComboBox Grid.Row="1" Grid.Column="1" Name="InstallType" Width="360" HorizontalAlignment="Left"/>
-              <Label Grid.Row="2" Content="Installer file"/>
-              <DockPanel Grid.Row="2" Grid.Column="1">
-                <Button DockPanel.Dock="Right" Name="BtnInstallAutoFill" Content="Auto-fill from file"/>
-                <ComboBox Name="InstallFile" IsEditable="True"/>
-              </DockPanel>
-              <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Hint}" Text="File name inside Files\ (pick from the list or type a relative path such as Setup\install.exe)."/>
-              <Label Grid.Row="4" Content="Arguments"/>
-              <DockPanel Grid.Row="4" Grid.Column="1">
-                <Button DockPanel.Dock="Right" Name="BtnProbeSandbox" Content="Find switches in Sandbox..." Margin="6,3,0,3" ToolTip="Runs the installer inside Windows Sandbox with candidate silent switches, records what gets registered and tests the uninstall. Nothing runs on this PC."/>
-                <ComboBox DockPanel.Dock="Right" Name="InstallPreset" Width="200" Margin="6,3,0,3"/>
-                <TextBox Name="InstallArgs" FontFamily="Consolas"/>
-              </DockPanel>
-              <TextBlock Grid.Row="5" Grid.Column="1" Style="{StaticResource Hint}" Name="InstallArgsHint" Text="EXE: silent switches. MSI: extra properties appended to the toolkit's /QN (e.g. ALLUSERS=1 ADDLOCAL=ALL). Script: parameters in PowerShell syntax."/>
-              <Label Grid.Row="6" Content="MST transforms"/>
-              <TextBox Grid.Row="6" Grid.Column="1" Name="InstallTransforms" FontFamily="Consolas"/>
-              <Label Grid.Row="7" Content="MSI product code"/>
-              <TextBox Grid.Row="7" Grid.Column="1" Name="InstallProductCode" FontFamily="Consolas" Width="360" HorizontalAlignment="Left"/>
-              <Label Grid.Row="8" Content="Processes to close"/>
-              <TextBox Grid.Row="8" Grid.Column="1" Name="CloseProcesses"/>
-              <TextBlock Grid.Row="9" Grid.Column="1" Style="{StaticResource Hint}" Text="Comma-separated process names without .exe. Optional friendly name with a pipe: winword|Microsoft Word, excel|Microsoft Excel"/>
-              <Label Grid.Row="10" Content="Exit codes"/>
-              <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
-                <Label Content="Success" Padding="0,5,0,0"/>
-                <TextBox Name="SuccessCodes" Width="160" FontFamily="Consolas"/>
-                <Label Content="Reboot" Margin="16,2,8,2" Padding="0,5,0,0"/>
-                <TextBox Name="RebootCodes" Width="160" FontFamily="Consolas"/>
-              </StackPanel>
-              <Label Grid.Row="11" Content="Dialogs"/>
-              <WrapPanel Grid.Row="11" Grid.Column="1">
-                <CheckBox Name="ShowWelcome" Content="Welcome / close-apps dialog"/>
-                <CheckBox Name="AllowDefer" Content="Allow defer"/>
-                <TextBox Name="DeferTimes" Width="40" Margin="0,3,4,3"/>
-                <Label Content="times" Padding="0,5,14,0"/>
-                <CheckBox Name="ShowProgress" Content="Progress dialog"/>
-                <CheckBox Name="ShowCompletion" Content="Completion prompt"/>
-              </WrapPanel>
-              <Label Grid.Row="12" Content="Pre-install PowerShell"/>
-              <TextBox Grid.Row="12" Grid.Column="1" Name="InstallPre" Style="{StaticResource Code}" Height="90"/>
-              <Label Grid.Row="13" Content="Custom install PowerShell"/>
-              <TextBox Grid.Row="13" Grid.Column="1" Name="InstallCustom" Style="{StaticResource Code}" Height="120"/>
-              <Label Grid.Row="14" Content="Post-install PowerShell"/>
-              <TextBox Grid.Row="14" Grid.Column="1" Name="InstallPost" Style="{StaticResource Code}" Height="90"/>
-            </Grid>
+            <StackPanel>
+              <!-- Drop zone: also shows progress and the result of an auto-package run. -->
+              <Grid Name="DropZone" Margin="0,0,0,14">
+                <Rectangle Name="DropZoneRect" RadiusX="10" RadiusY="10" Fill="White" Stroke="#B9B9B9" StrokeThickness="1.5" StrokeDashArray="5 4"/>
+                <Grid Margin="26,22,26,22">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Viewbox Width="54" Height="54" VerticalAlignment="Top" Margin="0,2,22,0">
+                    <Canvas Width="256" Height="256">
+                      <Rectangle Width="240" Height="240" Canvas.Left="8" Canvas.Top="8" RadiusX="52" RadiusY="52" Fill="#FFF1EE"/>
+                      <Path Stroke="{StaticResource Navy}" StrokeThickness="18" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                            Data="M 56 128 L 56 204 L 200 204 L 200 128 M 40 128 L 92 128 M 164 128 L 216 128"/>
+                      <Path Fill="{StaticResource Coral}" Data="M 110 40 L 146 40 L 146 112 L 178 112 L 128 168 L 78 112 L 110 112 Z"/>
+                    </Canvas>
+                  </Viewbox>
+                  <StackPanel Grid.Column="1">
+                    <TextBlock Name="DropTitle" Text="Drop an installer, script, .zip or folder here" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    <TextBlock Name="DropDetail" Style="{StaticResource Hint}" Margin="0,6,0,0"
+                               Text="It runs in Windows Sandbox as SYSTEM to find the silent switches, uninstall and detection, builds the package and tests it end to end. The tabs fill in as it learns. .msi, .exe, .msix, .ps1, .cmd, .bat, .vbs, .zip or a folder."/>
+                    <ProgressBar Name="DropProgress" IsIndeterminate="True" Margin="0,14,0,0" Visibility="Collapsed"/>
+                    <TextBlock Name="DropElapsed" Foreground="{StaticResource Subtle}" FontSize="12" Margin="0,6,0,0" Visibility="Collapsed"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
+                      <Button Name="BtnAutoPackage" Style="{StaticResource Primary}" Content="Auto-package a file..." Margin="0,0,0,0"
+                              ToolTip="Pick an installer (.msi, .exe, .msix), script (.ps1, .cmd, .bat, .vbs) or .zip. Folders: drag them onto the window."/>
+                      <Button Name="BtnOpenReport" Content="Open report" Margin="8,0,0,0" Visibility="Collapsed"/>
+                      <Button Name="BtnImportInstaller" Content="Read metadata only..." Margin="8,0,0,0"
+                              ToolTip="Only reads the file and fills the tabs for you to finish by hand; nothing is run."/>
+                    </StackPanel>
+                  </StackPanel>
+                </Grid>
+              </Grid>
+
+              <Border Style="{StaticResource Card}">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                  </Grid.RowDefinitions>
+                  <Label Grid.Row="0" Content="Vendor"/>
+                  <TextBox Grid.Row="0" Grid.Column="1" Name="AppVendor"/>
+                  <Label Grid.Row="1" Content="Application name"/>
+                  <TextBox Grid.Row="1" Grid.Column="1" Name="AppName"/>
+                  <Label Grid.Row="2" Content="Version"/>
+                  <TextBox Grid.Row="2" Grid.Column="1" Name="AppVersion" Width="220" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="3" Content="Architecture"/>
+                  <ComboBox Grid.Row="3" Grid.Column="1" Name="AppArch" Width="140" HorizontalAlignment="Left" IsEditable="True"/>
+                  <Label Grid.Row="4" Content="Language"/>
+                  <TextBox Grid.Row="4" Grid.Column="1" Name="AppLang" Width="80" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="5" Content="Revision"/>
+                  <TextBox Grid.Row="5" Grid.Column="1" Name="AppRevision" Width="80" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="6" Content="Script version"/>
+                  <TextBox Grid.Row="6" Grid.Column="1" Name="AppScriptVersion" Width="140" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="7" Content="Script author"/>
+                  <TextBox Grid.Row="7" Grid.Column="1" Name="AppAuthor" Width="300" HorizontalAlignment="Left"/>
+                  <TextBlock Grid.Row="8" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,12,0,0"
+                             Text="The output folder is named Vendor_Name_Version. Vendor, name and version also drive the PSADT dialog titles and log file names."/>
+                </Grid>
+              </Border>
+            </StackPanel>
           </ScrollViewer>
         </TabItem>
 
-        <TabItem Header="  4. Uninstall  ">
+        <TabItem Header="Source files">
+          <Border Style="{StaticResource Card}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <TextBlock Grid.Row="0" Style="{StaticResource Hint}"
+                         Text="Everything listed here is copied into the package. Files\ is for the installer, transforms, patches and scripts the deployment runs. SupportFiles\ is for anything else (config files, licences, fonts). 'Add folder contents' copies the files inside a folder; 'Add folder' copies the folder itself."/>
+              <DockPanel Grid.Row="1">
+                <TextBlock Style="{StaticResource Section}" Text="Files\" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                  <Button Name="BtnFilesAdd" Content="Add files..."/>
+                  <Button Name="BtnFilesAddFolder" Content="Add folder..."/>
+                  <Button Name="BtnFilesAddContents" Content="Add folder contents..."/>
+                  <Button Name="BtnFilesRemove" Content="Remove selected"/>
+                </StackPanel>
+              </DockPanel>
+              <ListBox Grid.Row="2" Name="FilesList" SelectionMode="Extended" FontFamily="Cascadia Mono, Consolas" FontSize="12" Margin="0,4,0,12"/>
+              <DockPanel Grid.Row="3">
+                <TextBlock Style="{StaticResource Section}" Text="SupportFiles\" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                  <Button Name="BtnSupportAdd" Content="Add files..."/>
+                  <Button Name="BtnSupportAddFolder" Content="Add folder..."/>
+                  <Button Name="BtnSupportAddContents" Content="Add folder contents..."/>
+                  <Button Name="BtnSupportRemove" Content="Remove selected"/>
+                </StackPanel>
+              </DockPanel>
+              <ListBox Grid.Row="5" Name="SupportList" SelectionMode="Extended" FontFamily="Cascadia Mono, Consolas" FontSize="12" Margin="0,4,0,0"/>
+            </Grid>
+          </Border>
+        </TabItem>
+
+        <TabItem Header="Install">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <Grid Margin="12">
+            <Border Style="{StaticResource Card}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="180"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                           Text="Defines the Install phase of Invoke-AppDeployToolkit.ps1 (Repair re-uses it). Pre/post PowerShell runs inside the toolkit session, so every *-ADT* function and $adtSession are available."/>
+                <Label Grid.Row="1" Content="Install type"/>
+                <ComboBox Grid.Row="1" Grid.Column="1" Name="InstallType" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="2" Content="Installer file"/>
+                <DockPanel Grid.Row="2" Grid.Column="1">
+                  <Button DockPanel.Dock="Right" Name="BtnInstallAutoFill" Content="Auto-fill from file"/>
+                  <ComboBox Name="InstallFile" IsEditable="True"/>
+                </DockPanel>
+                <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Hint}" Text="File name inside Files\ (pick from the list or type a relative path such as Setup\install.exe)."/>
+                <Label Grid.Row="4" Content="Arguments"/>
+                <DockPanel Grid.Row="4" Grid.Column="1">
+                  <Button DockPanel.Dock="Right" Name="BtnProbeSandbox" Content="Find switches in Sandbox..." ToolTip="Runs the installer inside Windows Sandbox as SYSTEM with candidate silent switches, records what it creates and tests the uninstall. Nothing runs on this PC."/>
+                  <ComboBox DockPanel.Dock="Right" Name="InstallPreset" Width="210" Margin="6,3,0,3"/>
+                  <TextBox Name="InstallArgs" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                </DockPanel>
+                <TextBlock Grid.Row="5" Grid.Column="1" Style="{StaticResource Hint}" Name="InstallArgsHint" Text="EXE: silent switches. MSI: extra properties appended to the toolkit's /QN (e.g. ALLUSERS=1 ADDLOCAL=ALL). Script: parameters in PowerShell syntax."/>
+                <Label Grid.Row="6" Content="MST transforms"/>
+                <TextBox Grid.Row="6" Grid.Column="1" Name="InstallTransforms" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <Label Grid.Row="7" Content="MSI product code"/>
+                <TextBox Grid.Row="7" Grid.Column="1" Name="InstallProductCode" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="8" Content="Processes to close"/>
+                <TextBox Grid.Row="8" Grid.Column="1" Name="CloseProcesses"/>
+                <TextBlock Grid.Row="9" Grid.Column="1" Style="{StaticResource Hint}" Text="Comma-separated process names without .exe. Optional friendly name with a pipe: winword|Microsoft Word, excel|Microsoft Excel"/>
+                <Label Grid.Row="10" Content="Exit codes"/>
+                <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
+                  <Label Content="Success"/>
+                  <TextBox Name="SuccessCodes" Width="160" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                  <Label Content="Reboot" Margin="18,2,8,2"/>
+                  <TextBox Name="RebootCodes" Width="160" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                </StackPanel>
+                <Label Grid.Row="11" Content="Dialogs"/>
+                <WrapPanel Grid.Row="11" Grid.Column="1">
+                  <CheckBox Name="ShowWelcome" Content="Welcome / close-apps dialog"/>
+                  <CheckBox Name="AllowDefer" Content="Allow defer" Margin="0,7,8,4"/>
+                  <TextBox Name="DeferTimes" Width="44" Margin="0,3,6,3"/>
+                  <Label Content="times" Margin="0,2,18,2"/>
+                  <CheckBox Name="ShowProgress" Content="Progress dialog"/>
+                  <CheckBox Name="ShowCompletion" Content="Completion prompt"/>
+                </WrapPanel>
+                <Label Grid.Row="12" Content="Pre-install PowerShell"/>
+                <TextBox Grid.Row="12" Grid.Column="1" Name="InstallPre" Style="{StaticResource Code}" Height="90"/>
+                <Label Grid.Row="13" Content="Custom install PowerShell"/>
+                <TextBox Grid.Row="13" Grid.Column="1" Name="InstallCustom" Style="{StaticResource Code}" Height="120"/>
+                <Label Grid.Row="14" Content="Post-install PowerShell"/>
+                <TextBox Grid.Row="14" Grid.Column="1" Name="InstallPost" Style="{StaticResource Code}" Height="90"/>
+              </Grid>
+            </Border>
+          </ScrollViewer>
+        </TabItem>
+
+        <TabItem Header="Uninstall">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <Border Style="{StaticResource Card}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="180"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                           Text="Defines the Uninstall phase. 'Installed app by name' searches the Uninstall registry (both views) and runs the registered uninstaller, which is the most robust option for EXE installers."/>
+                <Label Grid.Row="1" Content="Uninstall method"/>
+                <ComboBox Grid.Row="1" Grid.Column="1" Name="UninstallType" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="2" Content="MSI product code"/>
+                <TextBox Grid.Row="2" Grid.Column="1" Name="UninstallProductCode" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="3" Content="Installed app name"/>
+                <DockPanel Grid.Row="3" Grid.Column="1">
+                  <ComboBox DockPanel.Dock="Right" Name="UninstallAppType" Width="90" Margin="6,3,0,3"/>
+                  <Label DockPanel.Dock="Right" Content="App type" Margin="14,2,0,2"/>
+                  <CheckBox DockPanel.Dock="Right" Name="UninstallNameRegex" Content="Regex" Margin="14,7,0,4"/>
+                  <TextBox Name="UninstallName"/>
+                </DockPanel>
+                <TextBlock Grid.Row="4" Grid.Column="1" Style="{StaticResource Hint}" Text="DisplayName as shown in Apps and Features. Wildcards (*) are allowed; tick Regex for a .NET regular expression."/>
+                <Label Grid.Row="5" Content="Uninstaller / script"/>
+                <TextBox Grid.Row="5" Grid.Column="1" Name="UninstallFile" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="EXE method: full path on the device, $env:ProgramFiles etc. allowed. Script method: .ps1, .cmd, .bat or .vbs file name inside Files\."/>
+                <Label Grid.Row="7" Content="Arguments"/>
+                <TextBox Grid.Row="7" Grid.Column="1" Name="UninstallArgs" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <Label Grid.Row="8" Content="MSIX package name"/>
+                <TextBox Grid.Row="8" Grid.Column="1" Name="UninstallPackageName" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <Label Grid.Row="9" Content="Pre-uninstall PowerShell"/>
+                <TextBox Grid.Row="9" Grid.Column="1" Name="UninstallPre" Style="{StaticResource Code}" Height="90"/>
+                <Label Grid.Row="10" Content="Custom uninstall PowerShell"/>
+                <TextBox Grid.Row="10" Grid.Column="1" Name="UninstallCustom" Style="{StaticResource Code}" Height="120"/>
+                <Label Grid.Row="11" Content="Post-uninstall PowerShell"/>
+                <TextBox Grid.Row="11" Grid.Column="1" Name="UninstallPost" Style="{StaticResource Code}" Height="90"/>
+              </Grid>
+            </Border>
+          </ScrollViewer>
+        </TabItem>
+
+        <TabItem Header="Detection">
+          <Border Style="{StaticResource Card}">
+            <Grid>
               <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="170"/>
+                <ColumnDefinition Width="180"/>
                 <ColumnDefinition Width="*"/>
               </Grid.ColumnDefinitions>
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
               </Grid.RowDefinitions>
               <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                         Text="Defines the Uninstall phase. 'Installed app by name' searches the Uninstall registry (both views) and runs the registered uninstaller, which is the most robust option for EXE installers."/>
-              <Label Grid.Row="1" Content="Uninstall method"/>
-              <ComboBox Grid.Row="1" Grid.Column="1" Name="UninstallType" Width="360" HorizontalAlignment="Left"/>
+                         Text="Generates the Intune custom detection script (exit 0 + STDOUT = installed). Registry methods check the 64-bit and 32-bit HKLM views and HKCU. Minimum version makes the rule 'this version or newer', which keeps upgrades detected correctly."/>
+              <Label Grid.Row="1" Content="Detection method"/>
+              <ComboBox Grid.Row="1" Grid.Column="1" Name="DetectType" Width="380" HorizontalAlignment="Left"/>
               <Label Grid.Row="2" Content="MSI product code"/>
-              <TextBox Grid.Row="2" Grid.Column="1" Name="UninstallProductCode" FontFamily="Consolas" Width="360" HorizontalAlignment="Left"/>
-              <Label Grid.Row="3" Content="Installed app name"/>
-              <DockPanel Grid.Row="3" Grid.Column="1">
-                <ComboBox DockPanel.Dock="Right" Name="UninstallAppType" Width="80" Margin="6,3,0,3"/>
-                <Label DockPanel.Dock="Right" Content="App type" Margin="12,2,0,2"/>
-                <CheckBox DockPanel.Dock="Right" Name="UninstallNameRegex" Content="Regex" Margin="12,6,0,4"/>
-                <TextBox Name="UninstallName"/>
+              <TextBox Grid.Row="2" Grid.Column="1" Name="DetectProductCode" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="380" HorizontalAlignment="Left"/>
+              <Label Grid.Row="3" Content="Minimum version"/>
+              <TextBox Grid.Row="3" Grid.Column="1" Name="DetectMinVersion" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="220" HorizontalAlignment="Left"/>
+              <Label Grid.Row="4" Content="Display name"/>
+              <DockPanel Grid.Row="4" Grid.Column="1">
+                <ComboBox DockPanel.Dock="Right" Name="DetectMatchMode" Width="120" Margin="6,3,0,3"/>
+                <TextBox Name="DetectDisplayName"/>
               </DockPanel>
-              <TextBlock Grid.Row="4" Grid.Column="1" Style="{StaticResource Hint}" Text="DisplayName as shown in Apps and Features. Wildcards (*) are allowed; tick Regex for a .NET regular expression."/>
-              <Label Grid.Row="5" Content="Uninstaller / script"/>
-              <TextBox Grid.Row="5" Grid.Column="1" Name="UninstallFile" FontFamily="Consolas"/>
-              <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="EXE method: full path on the device, $env:ProgramFiles etc. allowed. Script method: .ps1 file name inside Files\."/>
-              <Label Grid.Row="7" Content="Arguments"/>
-              <TextBox Grid.Row="7" Grid.Column="1" Name="UninstallArgs" FontFamily="Consolas"/>
-              <Label Grid.Row="8" Content="MSIX package name"/>
-              <TextBox Grid.Row="8" Grid.Column="1" Name="UninstallPackageName" FontFamily="Consolas"/>
-              <Label Grid.Row="9" Content="Pre-uninstall PowerShell"/>
-              <TextBox Grid.Row="9" Grid.Column="1" Name="UninstallPre" Style="{StaticResource Code}" Height="90"/>
-              <Label Grid.Row="10" Content="Custom uninstall PowerShell"/>
-              <TextBox Grid.Row="10" Grid.Column="1" Name="UninstallCustom" Style="{StaticResource Code}" Height="120"/>
-              <Label Grid.Row="11" Content="Post-uninstall PowerShell"/>
-              <TextBox Grid.Row="11" Grid.Column="1" Name="UninstallPost" Style="{StaticResource Code}" Height="90"/>
+              <Label Grid.Row="5" Content="File path"/>
+              <DockPanel Grid.Row="5" Grid.Column="1">
+                <CheckBox DockPanel.Dock="Right" Name="DetectCheckVersion" Content="Compare file version" Margin="14,7,0,4"/>
+                <TextBox Name="DetectFilePath" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+              </DockPanel>
+              <Label Grid.Row="6" Content="MSIX package name"/>
+              <TextBox Grid.Row="6" Grid.Column="1" Name="DetectPackageName" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+              <Label Grid.Row="7" Content="Custom script"/>
+              <TextBox Grid.Row="7" Grid.Column="1" Name="DetectScript" Style="{StaticResource Code}" Height="120"/>
+              <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal" Margin="0,8,0,4">
+                <Button Name="BtnDetectPreview" Content="Preview detection script" Margin="0,3,0,3"/>
+                <Button Name="BtnDetectTest" Content="Run preview on this PC"/>
+                <TextBlock Name="DetectTestResult" VerticalAlignment="Center" Margin="14,0,0,0" FontWeight="SemiBold"/>
+              </StackPanel>
+              <TextBox Grid.Row="9" Grid.Column="1" Name="DetectPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
             </Grid>
-          </ScrollViewer>
+          </Border>
         </TabItem>
 
-        <TabItem Header="  5. Detection  ">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="170"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Generates the Intune custom detection script (exit 0 + STDOUT = installed). Registry methods check the 64-bit and 32-bit HKLM views and HKCU. Minimum version makes the rule 'this version or newer', which keeps upgrades detected correctly."/>
-            <Label Grid.Row="1" Content="Detection method"/>
-            <ComboBox Grid.Row="1" Grid.Column="1" Name="DetectType" Width="360" HorizontalAlignment="Left"/>
-            <Label Grid.Row="2" Content="MSI product code"/>
-            <TextBox Grid.Row="2" Grid.Column="1" Name="DetectProductCode" FontFamily="Consolas" Width="360" HorizontalAlignment="Left"/>
-            <Label Grid.Row="3" Content="Minimum version"/>
-            <TextBox Grid.Row="3" Grid.Column="1" Name="DetectMinVersion" FontFamily="Consolas" Width="200" HorizontalAlignment="Left"/>
-            <Label Grid.Row="4" Content="Display name"/>
-            <DockPanel Grid.Row="4" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Right" Name="DetectMatchMode" Width="110" Margin="6,3,0,3"/>
-              <TextBox Name="DetectDisplayName"/>
-            </DockPanel>
-            <Label Grid.Row="5" Content="File path"/>
-            <DockPanel Grid.Row="5" Grid.Column="1">
-              <CheckBox DockPanel.Dock="Right" Name="DetectCheckVersion" Content="Compare file version" Margin="12,6,0,4"/>
-              <TextBox Name="DetectFilePath" FontFamily="Consolas"/>
-            </DockPanel>
-            <Label Grid.Row="6" Content="MSIX package name"/>
-            <TextBox Grid.Row="6" Grid.Column="1" Name="DetectPackageName" FontFamily="Consolas"/>
-            <Label Grid.Row="7" Content="Custom script"/>
-            <TextBox Grid.Row="7" Grid.Column="1" Name="DetectScript" Style="{StaticResource Code}" Height="120"/>
-            <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal" Margin="0,6,0,2">
-              <Button Name="BtnDetectPreview" Content="Preview detection script" Margin="0,3,0,3"/>
-              <Button Name="BtnDetectTest" Content="Run preview on this PC"/>
-              <TextBlock Name="DetectTestResult" VerticalAlignment="Center" Margin="12,0,0,0" FontWeight="SemiBold"/>
-            </StackPanel>
-            <TextBox Grid.Row="9" Grid.Column="1" Name="DetectPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
-          </Grid>
+        <TabItem Header="Build">
+          <Border Style="{StaticResource Card}">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="180"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                         Text="Output: Destination\Vendor_Name_Version\ with Package\ (the PSADT folder to wrap), Detect-Name.ps1, Package.json, README.md with the Intune settings, and optionally Intune\Vendor_Name_Version.intunewin."/>
+              <Label Grid.Row="1" Content="Destination folder"/>
+              <DockPanel Grid.Row="1" Grid.Column="1">
+                <Button DockPanel.Dock="Right" Name="BtnBrowseDest" Content="Browse..."/>
+                <TextBox Name="OutDestination"/>
+              </DockPanel>
+              <Label Grid.Row="2" Content="Intune deploy mode"/>
+              <DockPanel Grid.Row="2" Grid.Column="1">
+                <ComboBox DockPanel.Dock="Left" Name="OutDeployMode" Width="170" VerticalAlignment="Top"/>
+                <TextBlock Style="{StaticResource Hint}" Margin="14,8,0,0" Text="Used in the README install/uninstall command lines. Silent = no dialogs (Required apps); Auto = dialogs when a user is logged on."/>
+              </DockPanel>
+              <Label Grid.Row="3" Content="Options"/>
+              <WrapPanel Grid.Row="3" Grid.Column="1">
+                <CheckBox Name="OutOverwrite" Content="Overwrite existing Package folder"/>
+                <CheckBox Name="OutBuildIntuneWin" Content="Build .intunewin"/>
+              </WrapPanel>
+              <Label Grid.Row="4" Content="IntuneWinAppUtil.exe"/>
+              <DockPanel Grid.Row="4" Grid.Column="1">
+                <Button DockPanel.Dock="Right" Name="BtnDownloadTool" Content="Download"/>
+                <Button DockPanel.Dock="Right" Name="BtnBrowseTool" Content="Browse..."/>
+                <TextBox Name="OutIntuneWinTool"/>
+              </DockPanel>
+              <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,12,0,4">
+                <Button Name="BtnGenerate" Style="{StaticResource Primary}" Content="Generate package" Margin="0,3,0,3"/>
+                <Button Name="BtnPreviewScript" Content="Preview deployment script"/>
+                <Button Name="BtnOpenOutput" Content="Open output folder"/>
+              </StackPanel>
+              <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,4,0,10" Text="Generate copies sources, creates the PSADT template (downloads the toolkit once if needed), writes the scripts, syntax-checks them and saves Package.json next to the package."/>
+              <TextBox Grid.Row="7" Grid.Column="1" Name="OutPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
+            </Grid>
+          </Border>
         </TabItem>
 
-        <TabItem Header="  6. Build  ">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="170"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Output: Destination\Vendor_Name_Version\ with Package\ (the PSADT folder to wrap), Detect-Name.ps1, Package.json, README.md with the Intune settings, and optionally Intune\Vendor_Name_Version.intunewin."/>
-            <Label Grid.Row="1" Content="Destination folder"/>
-            <DockPanel Grid.Row="1" Grid.Column="1">
-              <Button DockPanel.Dock="Right" Name="BtnBrowseDest" Content="Browse..."/>
-              <TextBox Name="OutDestination"/>
-            </DockPanel>
-            <Label Grid.Row="2" Content="Intune deploy mode"/>
-            <DockPanel Grid.Row="2" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Left" Name="OutDeployMode" Width="160" VerticalAlignment="Top"/>
-              <TextBlock Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Used in the README install/uninstall command lines. Silent = no dialogs (Required apps); Auto = dialogs when a user is logged on."/>
-            </DockPanel>
-            <Label Grid.Row="3" Content="Options"/>
-            <WrapPanel Grid.Row="3" Grid.Column="1">
-              <CheckBox Name="OutOverwrite" Content="Overwrite existing Package folder"/>
-              <CheckBox Name="OutBuildIntuneWin" Content="Build .intunewin"/>
-            </WrapPanel>
-            <Label Grid.Row="4" Content="IntuneWinAppUtil.exe"/>
-            <DockPanel Grid.Row="4" Grid.Column="1">
-              <Button DockPanel.Dock="Right" Name="BtnDownloadTool" Content="Download"/>
-              <Button DockPanel.Dock="Right" Name="BtnBrowseTool" Content="Browse..."/>
-              <TextBox Name="OutIntuneWinTool"/>
-            </DockPanel>
-            <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,4">
-              <Button Name="BtnGenerate" Content="Generate package" FontWeight="Bold" Padding="18,6" Margin="0,3,0,3"/>
-              <Button Name="BtnPreviewScript" Content="Preview deployment script"/>
-              <Button Name="BtnOpenOutput" Content="Open output folder"/>
-            </StackPanel>
-            <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="Generate copies sources, creates the PSADT template (downloads the toolkit once if needed), writes the scripts, syntax-checks them and saves Package.json next to the package."/>
-            <TextBox Grid.Row="7" Grid.Column="1" Name="OutPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
-          </Grid>
-        </TabItem>
-
-        <TabItem Header="  7. Intune  " Name="TabIntune">
+        <TabItem Header="Intune" Name="TabIntune">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="170"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="180"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
 
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Everything below is filled in from the other tabs; anything you type here overrides it. Publish creates the Win32 app, uploads the .intunewin and sets the commands, detection rule, return codes and requirements. Assignments are left for you."/>
+                <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                           Text="Everything below is filled in from the other tabs; anything you type here overrides it. Publish creates the Win32 app, uploads the .intunewin and sets the commands, detection rule, return codes and requirements. Assignments are left for you."/>
 
-            <Label Grid.Row="1" Content="Tenant"/>
-            <DockPanel Grid.Row="1" Grid.Column="1">
-              <Button DockPanel.Dock="Right" Name="BtnGraphConnect" Content="Connect..." Padding="14,4"/>
-              <TextBox Name="IntTenantId" Width="260" HorizontalAlignment="Left"/>
-              <TextBlock Name="IntConnStatus" Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Not connected. Blank tenant = whichever tenant you sign in to."/>
-            </DockPanel>
+                <Label Grid.Row="1" Content="Tenant"/>
+                <DockPanel Grid.Row="1" Grid.Column="1">
+                  <Button DockPanel.Dock="Right" Name="BtnGraphConnect" Content="Connect..."/>
+                  <TextBox Name="IntTenantId" Width="260" HorizontalAlignment="Left"/>
+                  <TextBlock Name="IntConnStatus" Style="{StaticResource Hint}" Margin="14,8,0,0" Text="Not connected. Blank tenant = whichever tenant you sign in to."/>
+                </DockPanel>
 
-            <Label Grid.Row="2" Content="App registration"/>
-            <DockPanel Grid.Row="2" Grid.Column="1">
-              <TextBox Name="IntClientId" Width="330" HorizontalAlignment="Left"/>
-              <TextBlock Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Blank = Microsoft Graph PowerShell client. Needs DeviceManagementApps.ReadWrite.All."/>
-            </DockPanel>
+                <Label Grid.Row="2" Content="App registration"/>
+                <DockPanel Grid.Row="2" Grid.Column="1">
+                  <TextBox Name="IntClientId" Width="330" HorizontalAlignment="Left"/>
+                  <TextBlock Style="{StaticResource Hint}" Margin="14,8,0,0" Text="Blank = Microsoft Graph PowerShell client. Needs DeviceManagementApps.ReadWrite.All."/>
+                </DockPanel>
 
-            <Label Grid.Row="3" Content="Name"/>
-            <TextBox Grid.Row="3" Grid.Column="1" Name="IntDisplayName"/>
+                <Label Grid.Row="3" Content="Name"/>
+                <TextBox Grid.Row="3" Grid.Column="1" Name="IntDisplayName"/>
 
-            <Label Grid.Row="4" Content="Publisher"/>
-            <TextBox Grid.Row="4" Grid.Column="1" Name="IntPublisher"/>
+                <Label Grid.Row="4" Content="Publisher"/>
+                <TextBox Grid.Row="4" Grid.Column="1" Name="IntPublisher"/>
 
-            <Label Grid.Row="5" Content="Description"/>
-            <TextBox Grid.Row="5" Grid.Column="1" Name="IntDescription" Height="54" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+                <Label Grid.Row="5" Content="Description"/>
+                <TextBox Grid.Row="5" Grid.Column="1" Name="IntDescription" Height="58" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"/>
 
-            <Label Grid.Row="6" Content="Developer / Owner"/>
-            <DockPanel Grid.Row="6" Grid.Column="1">
-              <TextBox Name="IntDeveloper" Width="300" HorizontalAlignment="Left"/>
-              <TextBox Name="IntOwner" Width="240" Margin="8,3,0,3" HorizontalAlignment="Left"/>
-            </DockPanel>
+                <Label Grid.Row="6" Content="Developer / Owner"/>
+                <DockPanel Grid.Row="6" Grid.Column="1">
+                  <TextBox Name="IntDeveloper" Width="300" HorizontalAlignment="Left"/>
+                  <TextBox Name="IntOwner" Width="240" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+                </DockPanel>
 
-            <Label Grid.Row="7" Content="Information / Privacy URL"/>
-            <DockPanel Grid.Row="7" Grid.Column="1">
-              <TextBox Name="IntInfoUrl" Width="300" HorizontalAlignment="Left"/>
-              <TextBox Name="IntPrivacyUrl" Width="300" Margin="8,3,0,3" HorizontalAlignment="Left"/>
-            </DockPanel>
+                <Label Grid.Row="7" Content="Information / Privacy URL"/>
+                <DockPanel Grid.Row="7" Grid.Column="1">
+                  <TextBox Name="IntInfoUrl" Width="300" HorizontalAlignment="Left"/>
+                  <TextBox Name="IntPrivacyUrl" Width="300" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+                </DockPanel>
 
-            <Label Grid.Row="8" Content="Install command"/>
-            <TextBox Grid.Row="8" Grid.Column="1" Name="IntInstallCmd" Style="{StaticResource Code}"/>
+                <Label Grid.Row="8" Content="Install command"/>
+                <TextBox Grid.Row="8" Grid.Column="1" Name="IntInstallCmd" Style="{StaticResource Code}"/>
 
-            <Label Grid.Row="9" Content="Uninstall command"/>
-            <TextBox Grid.Row="9" Grid.Column="1" Name="IntUninstallCmd" Style="{StaticResource Code}"/>
+                <Label Grid.Row="9" Content="Uninstall command"/>
+                <TextBox Grid.Row="9" Grid.Column="1" Name="IntUninstallCmd" Style="{StaticResource Code}"/>
 
-            <Label Grid.Row="10" Content="Install behavior"/>
-            <DockPanel Grid.Row="10" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Left" Name="IntRunAs" Width="200"/>
-              <ComboBox DockPanel.Dock="Left" Name="IntRestart" Width="290" Margin="8,3,0,3"/>
-              <TextBox Name="IntMaxRunTime" Width="60" Margin="8,3,0,3" HorizontalAlignment="Left"/>
-              <TextBlock Style="{StaticResource Hint}" Margin="8,6,0,0" Text="max run time (minutes)"/>
-            </DockPanel>
+                <Label Grid.Row="10" Content="Install behavior"/>
+                <DockPanel Grid.Row="10" Grid.Column="1">
+                  <ComboBox DockPanel.Dock="Left" Name="IntRunAs" Width="210"/>
+                  <ComboBox DockPanel.Dock="Left" Name="IntRestart" Width="300" Margin="8,3,0,3"/>
+                  <TextBox Name="IntMaxRunTime" Width="60" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+                  <TextBlock Style="{StaticResource Hint}" Margin="8,8,0,0" Text="max run time (minutes)"/>
+                </DockPanel>
 
-            <Label Grid.Row="11" Content="Requirements"/>
-            <DockPanel Grid.Row="11" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Left" Name="IntMinOs" Width="220"/>
-              <ComboBox DockPanel.Dock="Left" Name="IntArch" Width="130" Margin="8,3,0,3" IsEditable="True"/>
-              <CheckBox Name="IntAllowUninstall" Content="Allow uninstall for Available assignments" Margin="12,6,0,0"/>
-            </DockPanel>
+                <Label Grid.Row="11" Content="Requirements"/>
+                <DockPanel Grid.Row="11" Grid.Column="1">
+                  <ComboBox DockPanel.Dock="Left" Name="IntMinOs" Width="230"/>
+                  <ComboBox DockPanel.Dock="Left" Name="IntArch" Width="130" Margin="8,3,0,3" IsEditable="True"/>
+                  <CheckBox Name="IntAllowUninstall" Content="Allow uninstall for Available assignments" Margin="14,7,0,4"/>
+                </DockPanel>
 
-            <Label Grid.Row="12" Content="Detection"/>
-            <TextBlock Grid.Row="12" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,6,0,0"
-                       Text="The script from tab 5 is uploaded as the detection rule (64-bit, no signature check). Return codes come from the Install tab."/>
+                <Label Grid.Row="12" Content="Detection"/>
+                <TextBlock Grid.Row="12" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,8,0,0"
+                           Text="The script from the Detection tab is uploaded as the detection rule (64-bit, no signature check). Return codes come from the Install tab."/>
 
-            <StackPanel Grid.Row="13" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,4">
-              <Button Name="BtnIntunePublish" Content="Publish to Intune" FontWeight="Bold" Padding="18,6" Margin="0,3,0,3"/>
-              <Button Name="BtnIntunePreview" Content="Preview app JSON"/>
-              <Button Name="BtnIntuneReset" Content="Reset to auto values"/>
-            </StackPanel>
+                <StackPanel Grid.Row="13" Grid.Column="1" Orientation="Horizontal" Margin="0,12,0,6">
+                  <Button Name="BtnIntunePublish" Style="{StaticResource Primary}" Content="Publish to Intune" Margin="0,3,0,3"/>
+                  <Button Name="BtnIntunePreview" Content="Preview app JSON"/>
+                  <Button Name="BtnIntuneReset" Content="Reset to auto values"/>
+                </StackPanel>
 
-            <TextBox Grid.Row="14" Grid.Column="1" Name="IntPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA" MinHeight="120"/>
-          </Grid>
+                <TextBox Grid.Row="14" Grid.Column="1" Name="IntPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA" MinHeight="120"/>
+              </Grid>
+            </Border>
           </ScrollViewer>
         </TabItem>
 
       </TabControl>
-      <GridSplitter Grid.Row="1" Height="5" HorizontalAlignment="Stretch" Background="#D0D0D0" Margin="0,4"/>
-      <TextBox Grid.Row="2" Name="LogBox" Style="{StaticResource Code}" IsReadOnly="True" Background="#1E1E1E" Foreground="#DDDDDD"/>
+      <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ResizeDirection="Rows" Cursor="SizeNS"/>
+      <TextBox Grid.Row="2" Name="LogBox" Style="{StaticResource Code}" IsReadOnly="True" Background="#1C1C1F" Foreground="#D6D6D6" BorderBrush="#1C1C1F" Margin="0"/>
     </Grid>
   </DockPanel>
 </Window>
@@ -4718,9 +5250,35 @@ $script:LogSink = {
     $box = $script:ui.LogBox
     $box.AppendText($Line + "`r`n")
     $box.ScrollToEnd()
-    $script:ui.StatusText.Text = $Line.Substring(11)
+    # During an auto-package run the status bar shows the stage, not every log line.
+    if (-not $script:AutoPackageRunning) { $script:ui.StatusText.Text = $Line.Substring(11) }
     Invoke-UiRefresh
 }
+
+# Auto-package progress: an elapsed-time ticker (it ticks while long steps keep the window pumping) and the taskbar
+# button's progress, so a run is visibly alive even with the window minimised.
+$script:AutoPackageRunning = $false
+$script:AutoPackageStarted = $null
+$script:AutoPackageStep    = ''
+$script:ElapsedTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:ElapsedTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:ElapsedTimer.Add_Tick({
+    if (-not $script:AutoPackageStarted) { return }
+    $e = (Get-Date) - $script:AutoPackageStarted
+    $script:ui.DropElapsed.Text = ('{0}:{1:00} elapsed{2}' -f [int][Math]::Floor($e.TotalMinutes), $e.Seconds, $(if ($script:AutoPackageStep) { "  -  $($script:AutoPackageStep)" } else { '' }))
+})
+$script:Window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+
+# An unexpected error in an event handler is logged instead of closing the window (and losing the work on it).
+$script:Window.Dispatcher.Add_UnhandledException({
+    param($dispatcherSource, $e)
+    try { Write-PackagerLog "Unexpected error: $($e.Exception.Message)" -Level Error } catch { }
+    $e.Handled = $true
+})
+$script:Window.Add_Activated({
+    # The finished state stays on the taskbar button until the window is looked at.
+    if (-not $script:AutoPackageRunning) { $script:Window.TaskbarItemInfo.ProgressState = 'None' }
+})
 
 function Show-Message
 {
@@ -4986,7 +5544,7 @@ function Update-FieldStates
     $u.BtnInstallAutoFill.IsEnabled = $it -ne 'Custom'
     $u.InstallArgs.IsEnabled        = $it -ne 'Custom'
     $u.InstallPreset.IsEnabled      = $it -eq 'EXE'
-    $u.BtnProbeSandbox.IsEnabled    = $it -in @('EXE', 'Script')
+    $u.BtnProbeSandbox.IsEnabled    = $it -in @('EXE', 'Script') -and -not $script:AutoPackageRunning
     $u.InstallTransforms.IsEnabled  = $it -eq 'MSI'
     $u.InstallProductCode.IsEnabled = $it -eq 'MSI'
     $u.InstallCustom.IsEnabled      = $it -eq 'Custom'
@@ -5057,48 +5615,109 @@ function Import-InstallerIntoUi
     }
 }
 
+function Set-DropZone
+{
+    # The drop card on the Application tab doubles as the progress and result panel of an auto-package run.
+    param([string]$Title, [string]$Detail, [ValidateSet('Idle', 'Busy', 'Validated', 'Built', 'NeedsAttention', 'Failed')][string]$State = 'Idle')
+    $u = $script:ui
+    if ($PSBoundParameters.ContainsKey('Title'))  { $u.DropTitle.Text = $Title }
+    if ($PSBoundParameters.ContainsKey('Detail')) { $u.DropDetail.Text = $Detail }
+    $colour = switch ($State) { 'Validated' { '#0E7A0D' } 'NeedsAttention' { '#9A5B00' } 'Failed' { '#C42B1C' } default { '#1B1B1B' } }
+    $u.DropTitle.Foreground = (New-Object System.Windows.Media.BrushConverter).ConvertFromString($colour)
+    $busy = $State -eq 'Busy'
+    foreach ($e in @($u.DropProgress, $u.StatusProgress, $u.DropElapsed)) { $e.Visibility = $(if ($busy) { 'Visible' } else { 'Collapsed' }) }
+    # Assigned directly: $( ) around it would unroll the DoubleCollection into an object[] the property rejects.
+    if ($State -eq 'Idle' -or $busy) { $u.DropZoneRect.StrokeDashArray = [System.Windows.Media.DoubleCollection]::Parse('5 4') }
+    else { $u.DropZoneRect.StrokeDashArray = $null }
+    $edge = switch ($State) { 'Validated' { '#6CB76C' } 'NeedsAttention' { '#E0A040' } 'Failed' { '#E07060' } default { '#B9B9B9' } }
+    $u.DropZoneRect.Stroke = (New-Object System.Windows.Media.BrushConverter).ConvertFromString($edge)
+}
+
+function Set-AutoPackageBusy
+{
+    # Locks the actions that would collide with a run, and starts / stops the progress indicators.
+    param([bool]$Busy)
+    $u = $script:ui
+    $script:AutoPackageRunning = $Busy
+    foreach ($c in @($u.BtnAutoPackage, $u.BtnImportInstaller, $u.BtnGenerate, $u.BtnIntunePublish, $u.MenuNew, $u.MenuOpen, $u.BtnInstallAutoFill)) { $c.IsEnabled = -not $Busy }
+    if ($Busy)
+    {
+        $u.BtnProbeSandbox.IsEnabled = $false
+        $u.BtnOpenReport.Visibility  = 'Collapsed'
+        $script:AutoPackageStarted = Get-Date
+        $script:AutoPackageStep = ''
+        $u.DropElapsed.Text = '0:00 elapsed'
+        $script:ElapsedTimer.Start()
+        $script:Window.TaskbarItemInfo.ProgressState = 'Indeterminate'
+        $script:Window.Cursor = [System.Windows.Input.Cursors]::AppStarting
+    }
+    else
+    {
+        $script:ElapsedTimer.Stop()
+        $script:AutoPackageStarted = $null
+        $script:Window.Cursor = $null
+        Update-FieldStates
+    }
+}
+
+function Show-DefinitionInUi
+{
+    # Loads a definition into the tabs. For EXE installers it also selects the engine preset, then puts back the
+    # arguments that were worked out (selecting a preset rewrites the argument boxes).
+    param([Parameter(Mandatory)]$Def, [string]$Engine)
+    Set-UiDefinition -d $Def
+    if ($Def.Install.Type -eq 'EXE' -and $Engine)
+    {
+        $keys = @($script:SilentPresets.Keys)
+        $idx = [Array]::IndexOf($keys, $Engine); if ($idx -lt 0) { $idx = [Array]::IndexOf($keys, 'Unknown') }
+        $script:ui.InstallPreset.SelectedIndex = $idx
+        $script:ui.InstallArgs.Text   = "$($Def.Install.Arguments)"
+        $script:ui.UninstallArgs.Text = "$($Def.Uninstall.Arguments)"
+    }
+}
+
 function Start-AutoPackageFromUi
 {
-    # GUI wrapper for Invoke-AutoPackage: confirm, run (the window stays responsive through the log), then load the result.
-    param([Parameter(Mandatory)][string]$Path, [switch]$NoConfirm)
+    # GUI wrapper for Invoke-AutoPackage. The tabs fill in as soon as the file has been read and again as the sandbox
+    # learns more; the drop card shows the current step, an elapsed timer and finally the result.
+    param([Parameter(Mandatory)][string]$Path)
     if ($script:AutoPackageRunning) { Write-PackagerLog 'An auto-package run is already in progress.' -Level Warn; return }
     $sandbox = $false
     if (-not $NoSandbox) { $sandbox = [bool](Test-WindowsSandbox) }
-    $dest = "$($script:ui.OutDestination.Text)".Trim()
-    if (-not $dest) { $dest = 'C:\Packages' }
-    if (-not $NoConfirm)
-    {
-        $how = if ($sandbox)
-        {
-            "It runs the installer in Windows Sandbox as SYSTEM (no window opens) to find the silent switches, uninstall and detection, builds the package under $dest and tests the finished package end to end in a fresh sandbox. Usually 2-10 minutes."
-        }
-        else
-        {
-            "Windows Sandbox is not available, so nothing can be run: the package is built under $dest from what the file says, and the switches, uninstall and detection are best guesses."
-        }
-        if (-not (Confirm-Action -Text "Auto-package`n$Path`n`n$how`n`nThe current tabs are replaced." -Title 'Auto-package')) { return }
-    }
+    $leaf = Split-Path -Path $Path -Leaf
     $base = Get-UiDefinition
-    $script:AutoPackageRunning = $true
-    $script:ui.BtnAutoPackage.IsEnabled = $false
-    $script:ui.BtnGenerate.IsEnabled    = $false
-    $script:Window.Cursor = [System.Windows.Input.Cursors]::AppStarting
-    $script:ui.StatusText.Text = "Auto-packaging $(Split-Path -Path $Path -Leaf)..."
+
+    $script:ui.Tabs.SelectedIndex = 0
+    Set-AutoPackageBusy $true
+    Set-DropZone -Title "Packaging $leaf" -Detail 'Reading the file...' -State Busy
+    $script:ui.StatusText.Text = "Auto-packaging $leaf"
+    $onProgress = {
+        param($Stage, $Message, $Definition, $Info)
+        $script:AutoPackageStep = $(switch ($Stage) { 'Reading' { 'reading' } 'Read' { 'read' } 'Probing' { 'Windows Sandbox' } 'Probed' { 'worked out' } 'Building' { 'building' } 'Validating' { 'end-to-end test' } default { '' } })
+        if ($script:AutoPackageStarted)
+        {
+            $e = (Get-Date) - $script:AutoPackageStarted
+            $script:ui.DropElapsed.Text = ('{0}:{1:00} elapsed  -  {2}' -f [int][Math]::Floor($e.TotalMinutes), $e.Seconds, $script:AutoPackageStep)
+        }
+        Set-DropZone -Detail $Message -State Busy
+        $script:ui.StatusText.Text = $Message
+        if ($Definition)
+        {
+            $engine = ''
+            if ($Info) { $engine = "$($Info.Engine)" }
+            Show-DefinitionInUi -Def $Definition -Engine $engine
+            $script:ui.BtnProbeSandbox.IsEnabled = $false
+        }
+        Invoke-UiRefresh
+    }
     try
     {
         $confirm = { param($root) Confirm-Action -Text "A package already exists at`n$root`n`nRebuild it?" -Title 'Auto-package' }
-        $ctx = Invoke-AutoPackage -Path $Path -BaseDefinition $base -NoSandbox:(-not $sandbox) -SkipValidation:$SkipValidation -Force:([bool]$script:ui.OutOverwrite.IsChecked) -ConfirmOverwrite $confirm
+        $ctx = Invoke-AutoPackage -Path $Path -BaseDefinition $base -NoSandbox:(-not $sandbox) -SkipValidation:$SkipValidation -Force:([bool]$script:ui.OutOverwrite.IsChecked) -ConfirmOverwrite $confirm -OnProgress $onProgress
         $def = $ctx.Definition
-        Set-UiDefinition -d $def
-        if ($def.Install.Type -eq 'EXE' -and $ctx.Info)
-        {
-            # Selecting the preset rewrites the argument boxes; put the proven values back.
-            $keys = @($script:SilentPresets.Keys)
-            $idx = [Array]::IndexOf($keys, "$($ctx.Info.Engine)"); if ($idx -lt 0) { $idx = [Array]::IndexOf($keys, 'Unknown') }
-            $script:ui.InstallPreset.SelectedIndex = $idx
-            $script:ui.InstallArgs.Text   = "$($def.Install.Arguments)"
-            $script:ui.UninstallArgs.Text = "$($def.Uninstall.Arguments)"
-        }
+        $engine = ''
+        if ($ctx.Info) { $engine = "$($ctx.Info.Engine)" }
+        Show-DefinitionInUi -Def $def -Engine $engine
         $script:CurrentDefinitionPath = $null
         $script:Window.Title = 'PSADT Packager'
         if ($ctx.PackageRoot)
@@ -5108,36 +5727,44 @@ function Start-AutoPackageFromUi
             $script:Window.Title = "PSADT Packager - $(Split-Path -Path $ctx.PackageRoot -Leaf)"
         }
         foreach ($w in @($ctx.Warnings)) { Write-PackagerLog $w -Level Warn }
-        $head = switch ($ctx.Status)
+        $label = "$("$($def.App.Name) $($def.App.Version)".Trim())"
+        $warnings = ''
+        if (@($ctx.Warnings).Count -gt 0) { $warnings = "`n`n- " + (@($ctx.Warnings) -join "`n- ") }
+        switch ($ctx.Status)
         {
-            'Validated' { "Done and validated: installed, detected, uninstalled and confirmed gone in Windows Sandbox as SYSTEM." }
-            'Built'     { "Package built, but not tested end to end: $("$($ctx.ValidationNote)".TrimEnd('.'))." }
-            default     { 'Needs attention before you deploy it.' }
+            'Validated'
+            {
+                Set-DropZone -Title "Validated: $label" -State Validated -Detail ("Installed, detected, uninstalled and confirmed gone in Windows Sandbox as SYSTEM, the way Intune runs it. The package is in $($ctx.PackageRoot); every tab shows what was worked out." + $warnings)
+                $script:Window.TaskbarItemInfo.ProgressState = 'Normal'
+            }
+            'Built'
+            {
+                Set-DropZone -Title "Built: $label" -State Built -Detail ("The package is in $($ctx.PackageRoot), but it was not tested end to end: $("$($ctx.ValidationNote)".TrimEnd('.'))." + $warnings)
+                $script:Window.TaskbarItemInfo.ProgressState = 'Normal'
+            }
+            default
+            {
+                Set-DropZone -Title "Needs attention: $(if ($label) { $label } else { $leaf })" -State NeedsAttention -Detail ("Check these before deploying; the tabs show what was worked out so far." + $warnings)
+                $script:Window.TaskbarItemInfo.ProgressState = 'Paused'
+            }
         }
-        $body = $head
-        if (@($ctx.Warnings).Count -gt 0) { $body += "`n`n- " + (@($ctx.Warnings) -join "`n- ") }
-        $script:ui.StatusText.Text = "Auto-package: $($ctx.Status)"
-        if ($ctx.ReportPath)
-        {
-            if (Confirm-Action -Text "$body`n`nOpen the report?" -Title "Auto-package: $($ctx.Status)") { Start-Process -FilePath $ctx.ReportPath }
-        }
-        else
-        {
-            Show-Message -Text "$body`n`nThe tabs show what was worked out; fix the items above and use Generate package." -Title "Auto-package: $($ctx.Status)" -Icon Warning
-        }
+        $script:Window.TaskbarItemInfo.ProgressValue = 1
+        $script:LastReportPath = $ctx.ReportPath
+        if ($ctx.ReportPath) { $script:ui.BtnOpenReport.Visibility = 'Visible' }
+        $script:ui.StatusText.Text = "Auto-package: $($ctx.Status) - $leaf"
+        if (-not $script:Window.IsActive) { $script:Window.Activate() | Out-Null }
     }
     catch
     {
         Write-PackagerLog "Auto-package failed: $($_.Exception.Message)" -Level Error
+        Set-DropZone -Title "Auto-package failed: $leaf" -Detail $_.Exception.Message -State Failed
         $script:ui.StatusText.Text = 'Auto-package failed'
-        Show-Message -Text $_.Exception.Message -Title 'Auto-package' -Icon Error
+        $script:Window.TaskbarItemInfo.ProgressState = 'Error'
+        $script:Window.TaskbarItemInfo.ProgressValue = 1
     }
     finally
     {
-        $script:AutoPackageRunning = $false
-        $script:ui.BtnAutoPackage.IsEnabled = $true
-        $script:ui.BtnGenerate.IsEnabled    = $true
-        $script:Window.Cursor = $null
+        Set-AutoPackageBusy $false
     }
 }
 
@@ -5281,6 +5908,9 @@ $script:ui.BtnImportInstaller.Add_Click({
     $p = Select-FileDialog -Title 'Select the installer' -Filter 'Installers and scripts (*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs)|*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs|All files (*.*)|*.*'
     if ($p.Count -gt 0) { Import-InstallerIntoUi -Path $p[0] }
 })
+$script:ui.BtnOpenReport.Add_Click({
+    if ($script:LastReportPath -and (Test-Path -LiteralPath $script:LastReportPath)) { Start-Process -FilePath $script:LastReportPath }
+})
 $script:ui.BtnAutoPackage.Add_Click({
     $p = Select-FileDialog -Title 'Auto-package: pick an installer, script or .zip (drag folders onto the window)' -Filter 'Installers, scripts and archives (*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs;*.zip)|*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs;*.zip|All files (*.*)|*.*'
     if ($p.Count -gt 0) { Start-AutoPackageFromUi -Path $p[0] }
@@ -5290,12 +5920,25 @@ $script:ui.BtnAutoPackage.Add_Click({
 # has completed, so Explorer is not left waiting on it.
 $script:Window.Add_PreviewDragOver({
     param($dragSource, $e)
-    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = [System.Windows.DragDropEffects]::Copy }
+    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop) -and -not $script:AutoPackageRunning)
+    {
+        $e.Effects = [System.Windows.DragDropEffects]::Copy
+        # Light up the drop card while something is being dragged over the window (its own edge comes back after).
+        if (-not $script:DropEdge) { $script:DropEdge = $script:ui.DropZoneRect.Stroke }
+        $script:ui.DropZoneRect.Stroke = $script:Window.FindResource('Focus')
+        $script:ui.DropZoneRect.Fill   = (New-Object System.Windows.Media.BrushConverter).ConvertFromString('#F4F7FC')
+    }
     else { $e.Effects = [System.Windows.DragDropEffects]::None }
     $e.Handled = $true
 })
+$script:Window.Add_PreviewDragLeave({
+    $script:ui.DropZoneRect.Fill = [System.Windows.Media.Brushes]::White
+    if ($script:DropEdge) { $script:ui.DropZoneRect.Stroke = $script:DropEdge; $script:DropEdge = $null }
+})
 $script:Window.Add_PreviewDrop({
     param($dragSource, $e)
+    $script:ui.DropZoneRect.Fill = [System.Windows.Media.Brushes]::White
+    if ($script:DropEdge) { $script:ui.DropZoneRect.Stroke = $script:DropEdge; $script:DropEdge = $null }
     if (-not $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { return }
     $e.Handled = $true
     $dropped = @($e.Data.GetData([System.Windows.DataFormats]::FileDrop))
@@ -5660,7 +6303,7 @@ if ($InstallerPath)
     $script:Window.Add_ContentRendered({
         $p = $script:StartupInstallerPath
         $script:StartupInstallerPath = $null
-        if ($p) { Start-AutoPackageFromUi -Path $p -NoConfirm }
+        if ($p) { Start-AutoPackageFromUi -Path $p }
     })
 }
 Write-PackagerLog "PSADT Packager $script:PackagerVersion ready (PowerShell $($PSVersionTable.PSVersion)). Drop an installer, script, .zip or folder on this window to auto-package it."
