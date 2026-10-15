@@ -1,6 +1,6 @@
 # PSADT Packager
 
-A standard packager for Intune and ConfigMgr built on [PSAppDeployToolkit v4](https://psappdeploytoolkit.com). Point it at an installer, fill in (or accept) the install, uninstall and detection settings, and it produces a complete, consistent package every time.
+A standard packager for Intune and ConfigMgr built on [PSAppDeployToolkit v4](https://psappdeploytoolkit.com). Drop in an installer, script, zip or folder and it works out the install, uninstall and detection on its own: it runs the thing in Windows Sandbox as SYSTEM, builds the package, then tests the finished package end to end. Or fill in the tabs yourself; either way you get a complete, consistent package every time.
 
 ```
 <Destination>\<Vendor>_<Name>_<Version>\
@@ -11,10 +11,25 @@ A standard packager for Intune and ConfigMgr built on [PSAppDeployToolkit v4](ht
     Package.json                  the definition - reopen it to change anything and rebuild
     README.md                     Intune Win32 app settings for this package
     IntuneApp.json                the exact Win32 app body that gets posted to Graph
-    Intune\<Vendor>_<Name>_<Version>.intunewin   (optional, via IntuneWinAppUtil.exe)
+    AutoPackage-Report.md         auto-package only: what was decided, why, and what the sandbox proved
+    Validation\                   auto-package only: toolkit logs from the end-to-end test
+    Intune\<Vendor>_<Name>_<Version>.intunewin   (via IntuneWinAppUtil.exe)
 ```
 
 Everything is one file, `PsadtPackager.ps1`. No install, no build step. Runs on Windows PowerShell 5.1 and PowerShell 7.
+
+## Install
+
+Run `PSADT-Packager-<version>-x64.msi` (or `msiexec /i PSADT-Packager-<version>-x64.msi /qn`). It installs per machine
+to `C:\Program Files\PSADT Packager` with a Start menu entry. *PSADT Packager.exe* is a small launcher that opens the
+GUI in Windows PowerShell 5.1 without a console window; drop an installer, script, zip or folder on it (or on a
+shortcut to it) to auto-package it straight away. Upgrades install over the top; uninstalling leaves each user's
+`%LOCALAPPDATA%\PsadtPackager` (settings, toolkit cache, sandbox runs).
+
+For scripting and CI, call `PsadtPackager.ps1` in the install folder directly; the launcher doesn't wait or show output.
+
+Build the MSI yourself with `.\installer\Build-Installer.ps1` (needs the .NET SDK; WiX 5.0.2 comes from NuGet). It writes
+`dist\PSADT-Packager-<version>-x64.msi`. The MSI and launcher are not code-signed, so SmartScreen may warn on first run.
 
 ## Run
 
@@ -22,7 +37,15 @@ Everything is one file, `PsadtPackager.ps1`. No install, no build step. Runs on 
 .\PsadtPackager.ps1
 ```
 
-Headless rebuild from a saved definition (CI, bulk re-packaging after a toolkit update):
+Then drop an installer, script, `.zip` or folder anywhere on the window (or click *Auto-package...* on the Application tab).
+
+Headless, straight from an installer (CI, bulk packaging):
+
+```powershell
+.\PsadtPackager.ps1 -InstallerPath C:\Sources\npp.8.9.8.1.Installer.x64.exe -NoGui -Destination C:\Packages
+```
+
+Headless rebuild from a saved definition (bulk re-packaging after a toolkit update):
 
 ```powershell
 .\PsadtPackager.ps1 -Definition .\examples\GitHub-CLI.json -NoGui -Force
@@ -30,12 +53,47 @@ Headless rebuild from a saved definition (CI, bulk re-packaging after a toolkit 
 
 The first build downloads PSAppDeployToolkit from the PowerShell Gallery into `%LOCALAPPDATA%\PsadtPackager\Modules` (or uses an installed copy). The toolkit shipped inside each package is the exact version that generated it.
 
+## Auto-package
+
+What you can drop in, and how it is treated:
+
+| Input | Treated as |
+| --- | --- |
+| `.msi` | Windows Installer; product code, version and architecture from the MSI. `.mst` files next to it are applied as transforms. |
+| `.exe` | Installer; the engine (Inno, NSIS, InstallShield, WiX Burn, ...) is recognised and its silent switches proven in the sandbox. |
+| `.msix` / `.appx` (bundles) | Provisioned for all users. |
+| `.ps1`, `.cmd`, `.bat`, `.vbs` | Script install; detection and uninstall are derived from what the script creates. |
+| Folder | Searched for the entry point: `install.*`/`setup.*` scripts first, then a single MSI, then `setup.exe`, then any recognisable installer. An `uninstall.*` / `remove.*` script is used for the uninstall. A folder of program files with no installer is a portable app. |
+| `.zip` | Extracted, then treated like a folder. |
+
+Then, for installers and scripts:
+
+1. **Read the file**: name, vendor, version and architecture from the MSI, version resource or file/folder name (versions, `(x64)` and e-mail/URL vendors are cleaned up).
+2. **Run it in Windows Sandbox as SYSTEM**, like Intune does, one fresh sandbox per attempt. For an EXE it tries the engine's switches first, then switches found inside the binary, and stops at the first that installs silently. It records everything the install created: uninstall entries, folders, shortcuts, registry keys, services and scheduled tasks, and the help text the installer shows for `/?`.
+3. **Decide**: detection from the uninstall entry the installer registered (version-tolerant when the name carries the version), otherwise the main program file, a service or a registry key. Uninstall looks the app up by its exact registered name at uninstall time and runs the uninstall command it registered (proven in the same sandbox), with the exact arguments that worked, so it keeps working after the app updates itself. It runs from the Windows folder rather than the uninstaller's own, because uninstallers that delete their own folder (Chromium's `setup.exe`) otherwise report failure. A non-standard exit code that meant success there (Chromium returns 19) is ignored, so the package itself exits 0 and Intune sees a successful uninstall. Without a registered uninstaller it uses a shipped uninstall script, or generated clean-up of what the install created. Publisher and version come from what was registered.
+4. **Build** the package and `.intunewin` (IntuneWinAppUtil.exe is downloaded if needed).
+5. **Test the package** in a fresh sandbox as SYSTEM: install, detection, uninstall, detection again. Anything left behind after the uninstall is listed.
+
+In the GUI the tabs fill in as soon as the file has been read and again as the sandbox learns more. The drop card on the Application tab shows the current step, an elapsed timer and finally the result (green when validated) with an *Open report* button; the taskbar button shows progress too, and the log gets a "still running" line every 30 seconds during long installs.
+
+`AutoPackage-Report.md` shows each setting, how it was determined, the sandbox attempts and the end-to-end result. Status is **Validated** (all four steps passed), **Built** (not tested end to end) or **Needs attention** (no silent switches found, the test failed, or a per-user installer that lands in the SYSTEM profile). Headless exit codes: 0 validated or built, 2 needs attention, 1 error. `-NoSandbox` packages from the file alone; `-SkipValidation` skips step 5.
+
+MSI and MSIX are fully described by the file, so they skip step 2 and go straight to the end-to-end test.
+
+Limits worth knowing:
+
+* **Per-user installers** (many Electron / Squirrel apps) install into the profile of whoever runs them. As SYSTEM that is the system profile, so the report flags them; look for the vendor's machine-wide installer (often an MSI) or deploy in the user context.
+* **Installers that need a licence key, a server name or a reboot mid-way** cannot be guessed. The probe reports which switches it tried and the installer's own `/?` help text so you can finish it on the Install tab.
+* **Generated uninstalls** (scripts and installers that register no uninstaller) remove exactly what the sandbox saw being created. Review them before production use; the end-to-end test proves they run cleanly, not that nothing else needed removing.
+* **VBScript installers (`.vbs`) cannot be observed** on current Windows: VBScript is an optional component Microsoft is retiring, and the Windows Sandbox image does not include it (nor can it be added there). The report says so; set detection and uninstall by hand, or better, convert the script to PowerShell before VBScript disappears from your devices too.
+* **Every MSI install inside Windows Sandbox pauses for about two minutes** at the Windows Installer's software-restriction check (measured: 7-Zip's MSI takes ~121 s there, every time, with or without networking). It is a sandbox quirk, not the package, but it makes MSI-based apps slower to test: a WiX bundle with two MSIs takes ~4 minutes per run. The stuck rules allow for it.
+
 ## Workflow
 
-1. **Application**: click *Read metadata from installer*. MSI, EXE, MSIX/AppX and PS1 are supported. Vendor, name, version, product code, silent switches, uninstall method and detection rule are filled from the file.
+1. **Application**: *Auto-package...* does everything above. *Read metadata from installer* only reads the file (MSI, EXE, MSIX/AppX, PS1, CMD, BAT, VBS) and fills vendor, name, version, product code, silent switches, uninstall method and detection for you to finish by hand.
 2. **Source files**: add anything else the install needs (transforms, config, extra installers). Folders can be copied as a subfolder or flattened.
 3. **Install**: install type, arguments, transforms, processes to close, exit codes, dialogs, plus pre/post PowerShell that runs inside the toolkit session.
-4. **Uninstall**: MSI product code, installed app by name (`Uninstall-ADTApplication`), uninstaller EXE on the device, script, MSIX, custom or none.
+4. **Uninstall**: MSI product code, installed app by name, uninstaller EXE on the device, script, MSIX, custom or none. A name matches exactly unless it contains `*` (wildcard) or *Regex* is ticked: the toolkit's own default would also remove every app whose name merely contains it (`Brave` would take `Brave Beta` with it). With app type EXE the package runs the registered uninstall command itself (`Get-ADTApplication` + `Start-ADTProcess`, from the Windows folder); otherwise it uses `Uninstall-ADTApplication`.
 5. **Detection**: MSI product code, registry DisplayName (exact / wildcard / regex), file (optionally version), MSIX, or paste your own. *Run preview on this PC* executes the generated script locally.
 6. **Build**: destination, Intune deploy mode for the generated command lines, optional `.intunewin`.
 7. **Intune**: sign in and publish. Every field is derived from the tabs above; type over anything you want to change.
@@ -50,29 +108,37 @@ The generator only writes the `Variables` and `Functions` sections of `Invoke-Ap
 | --- | --- |
 | MSI | `Start-ADTMsiProcess -Action Install -FilePath … [-Transforms …] [-AdditionalArgumentList …]` |
 | EXE | `Start-ADTProcess -FilePath … -ArgumentList '…' -WindowStyle Hidden` |
-| PowerShell script | `& "$($adtSession.DirFiles)\Install.ps1" <args>` (in-process, full toolkit access) |
+| PowerShell script | `& "$($adtSession.DirFiles)\Install.ps1" <args>` from the script's folder (in-process, full toolkit access; a failing exit code fails the deployment) |
+| Batch / VBScript | `Start-ADTProcess` running `cmd.exe /c` or `cscript.exe //B` from the script's folder |
 | MSIX / AppX | `Add-AppxProvisionedPackage -Online -PackagePath … -SkipLicense` |
 | Custom | your code becomes the Install phase |
 
-Silent-switch presets are provided for Inno Setup, NSIS, InstallShield, WiX Burn, Squirrel, InstallAware, Advanced Installer, install4j, InstallBuilder, InstallAnywhere, Qt IFW, Wise, Setup Factory and 7-Zip/WinRAR self-extractors; the engine is detected from the EXE where possible, and the log lists any known switches found as strings inside the binary.
+Silent-switch presets are provided for Inno Setup, NSIS, InstallShield, WiX Burn, Omaha / Google Update (Chrome, Brave, Edge: `/silent /install`), Squirrel, InstallAware, Advanced Installer, install4j, InstallBuilder, InstallAnywhere, Qt IFW, Wise, Setup Factory and 7-Zip/WinRAR self-extractors; the engine is detected from the EXE where possible, and the log lists any known switches found as strings inside the binary.
 
 ## Finding switches by running the installer
 
-Signature detection is a guess. *Find switches in Sandbox...* on the Install tab proves it: for each candidate
-switch set it boots a fresh Windows Sandbox, maps the installer folder read-only, runs `setup.exe /?` and
-captures the help dialog (UI Automation) or console output, then runs the candidate while watching the process
-tree for any window that stays up. It snapshots the Uninstall registry before and after, so a successful run
-reports the real `DisplayName`, `DisplayVersion`, `Publisher` and `UninstallString`/`QuietUninstallString`,
-runs your detection script, then runs the uninstall and confirms the key disappears.
+Signature detection is a guess. *Find switches in Sandbox...* on the Install tab (and auto-package) proves it:
+for each candidate switch set it starts a fresh, headless Windows Sandbox (no window opens), copies the installer in
+and runs it **as SYSTEM**, the account Intune uses. It runs `setup.exe /?` first and captures the help dialog's text
+or console output, then runs the candidate while watching the whole process tree. SYSTEM has no visible desktop,
+so an installer waiting for a click just sits there: a run counts as stuck when the tree (plus anything it started,
+such as the Windows Installer service) goes idle for 30 seconds while it shows a window with controls (quiet-mode
+windows that are created but never shown don't count), or stays idle for five minutes without one. It snapshots
+the system before and after, so a successful run reports the real uninstall entry (`DisplayName`,
+`DisplayVersion`, `Publisher`, `UninstallString`/`QuietUninstallString`) and everything else the install created,
+runs your detection script, then runs the uninstall and confirms the entry is gone and detection is negative.
 
 The first candidate that installs silently wins. One click applies it: install arguments, a verified uninstall
-command, an exact-match registry detection rule, and vendor/version if the Application tab had them blank.
-Candidates are ordered: your current arguments, the detected engine's preset, generic switches whose strings
-appear in the binary, then the rest (four per run by default; each takes roughly one to three minutes).
+command, a registry detection rule, and vendor/version if the Application tab had them blank. Candidates are
+ordered: your current arguments, the detected engine's preset, generic switches whose strings appear in the binary,
+then the rest (four per run by default; each takes about a minute). Scripts are run once to see what they create.
 
-Nothing runs on the packaging PC. Requires Windows Sandbox (Pro/Enterprise/Education with virtualisation):
-`Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM`. Run folders with
-`probe.log`, `result-N.json` and the `.wsb` live under `%LOCALAPPDATA%\PsadtPackager\Sandbox\`.
+Nothing runs on the packaging PC. Requires Windows Sandbox with its command-line tool `wsb.exe`, which ships with
+Windows 11 24H2 and later (Pro/Enterprise/Education, virtualisation on). Enable it in *Windows Features*, or from an
+elevated **Windows PowerShell 5.1** prompt (the DISM cmdlets fail with "Class not registered" in the Store build of
+PowerShell 7): `Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM`, then reboot. Only
+one sandbox can run at a time. Run folders with `config.json`, `probe.log` and `result.json` live under
+`%LOCALAPPDATA%\PsadtPackager\Sandbox\`.
 
 ## Detection scripts
 
@@ -121,8 +187,10 @@ Use `-DeployMode Auto` (or omit it) for Available assignments where you want the
 
 | Path | Purpose |
 | --- | --- |
-| `PsadtPackager.ps1` | GUI, definition model, code generators, headless build |
+| `PsadtPackager.ps1` | GUI, definition model, code generators, sandbox probe, auto-package, headless build |
 | `examples\` | Sample definitions (edit the `Sources.Files` paths to match your share) |
+| `installer\` | MSI build: `Build-Installer.ps1`, the launcher (`Launcher.cs`) and the WiX package (`Package.wxs`) |
+| `tests\Test-PsadtPackager.ps1` | Offline regression tests (no sandbox or network): name/version clean-up, input classification, probe decisions, and that every generated script parses. Run it under both PowerShell 5.1 and 7. |
 
 ## Notes
 

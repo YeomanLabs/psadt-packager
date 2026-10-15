@@ -1,2 +1,5 @@
 out/
 *.intunewin
+installer/bin/
+installer/obj/
+dist/

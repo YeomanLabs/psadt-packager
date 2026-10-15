@@ -22,8 +22,22 @@
     Path to a Package.json definition. With -NoGui the package is built immediately;
     without -NoGui the GUI opens with the definition loaded.
 
+.PARAMETER InstallerPath
+    Auto-package: an installer (.msi, .exe, .msix/.appx), a script (.ps1, .cmd, .bat, .vbs), a .zip or a
+    folder. The packager reads it, runs it in Windows Sandbox as SYSTEM to work out the silent switches,
+    uninstall and detection, builds the package, tests it end to end in a fresh sandbox and writes
+    AutoPackage-Report.md next to it. With -NoGui it runs headlessly; without, the GUI opens and starts it.
+
+.PARAMETER NoSandbox
+    Auto-package from the file alone; nothing is run (switches, uninstall and detection are guesses).
+
+.PARAMETER SkipValidation
+    Auto-package without the final end-to-end test of the built package.
+
 .PARAMETER NoGui
-    Build headlessly from -Definition (for CI / repeatable rebuilds).
+    Build headlessly from -Definition or -InstallerPath (for CI / repeatable rebuilds).
+    Exit code 0 = built (and validated when a sandbox was available), 1 = error, 2 = built or attempted
+    but it needs attention (see AutoPackage-Report.md).
 
 .PARAMETER Destination
     Overrides Output.Destination from the definition.
@@ -45,7 +59,10 @@
     .\PsadtPackager.ps1
 
 .EXAMPLE
-    .\PsadtPackager.ps1 -Definition .\examples\7-Zip.json -NoGui -Force
+    .\PsadtPackager.ps1 -Definition .\examples\Notepad++.json -NoGui -Force
+
+.EXAMPLE
+    .\PsadtPackager.ps1 -InstallerPath C:\Sources\npp.8.9.8.1.Installer.x64.exe -NoGui -Destination C:\Packages
 
 .NOTES
     Works on Windows PowerShell 5.1 and PowerShell 7 (Windows only - WPF).
@@ -56,6 +73,13 @@ param
 (
     [Parameter(Position = 0)]
     [string]$Definition,
+
+    [Alias('Path')]
+    [string]$InstallerPath,
+
+    [switch]$NoSandbox,
+
+    [switch]$SkipValidation,
 
     [switch]$NoGui,
 
@@ -70,10 +94,31 @@ param
     [string]$ClientId
 )
 
+# Windows PowerShell started from a PowerShell 7 session (other than by pwsh itself, which cleans this up) inherits
+# PowerShell 7's module folders, and then every module import fails with "Error in TypeData ... is already present".
+# Restart once with the module path a process started from Explorer gets, passing the same arguments and exit code.
+if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUNCHED)
+{
+    $foreignModules = @("$env:PSModulePath" -split ';' | Where-Object { $_ -and $_ -notmatch 'WindowsPowerShell' -and ($_ -match '\\PowerShell\\' -or $_ -match 'microsoft\.powershell_') })
+    if ($foreignModules.Count -gt 0)
+    {
+        $env:PSADT_PACKAGER_RELAUNCHED = '1'
+        $env:PSModulePath = (@([Environment]::GetEnvironmentVariable('PSModulePath', 'Machine'), [Environment]::GetEnvironmentVariable('PSModulePath', 'User')) | Where-Object { $_ }) -join ';'
+        $relaunch = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+        foreach ($kv in $PSBoundParameters.GetEnumerator())
+        {
+            if ($kv.Value -is [System.Management.Automation.SwitchParameter]) { if ($kv.Value.IsPresent) { $relaunch += "-$($kv.Key)" } }
+            else { $relaunch += "-$($kv.Key)"; $relaunch += ('"{0}"' -f $kv.Value) }
+        }
+        $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $relaunch -NoNewWindow -Wait -PassThru
+        exit $child.ExitCode
+    }
+}
+
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.0.1'
+$script:PackagerVersion = '1.1.1'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -81,9 +126,9 @@ $script:IntuneWinUrl    = 'https://github.com/microsoft/Microsoft-Win32-Content-
 $script:LogSink         = { param($Line, $Level) if ($Level -eq 'Error') { Write-Host $Line -ForegroundColor Red } elseif ($Level -eq 'Warn') { Write-Host $Line -ForegroundColor Yellow } else { Write-Host $Line } }
 
 $script:InstallTypeCodes   = @('MSI', 'EXE', 'Script', 'MSIX', 'Custom')
-$script:InstallTypeLabels  = @('MSI (Start-ADTMsiProcess)', 'EXE / setup.exe (Start-ADTProcess)', 'PowerShell script in Files\', 'MSIX / AppX (provisioned)', 'Custom PowerShell (you write the Install phase)')
+$script:InstallTypeLabels  = @('MSI (Start-ADTMsiProcess)', 'EXE / setup.exe (Start-ADTProcess)', 'Script in Files\ (.ps1, .cmd, .bat, .vbs)', 'MSIX / AppX (provisioned)', 'Custom PowerShell (you write the Install phase)')
 $script:UninstallTypeCodes = @('MSI', 'Name', 'EXE', 'Script', 'MSIX', 'Custom', 'None')
-$script:UninstallTypeLabels= @('MSI product code (Start-ADTMsiProcess)', 'Installed app by name (Uninstall-ADTApplication)', 'Uninstaller EXE on the device (Start-ADTProcess)', 'PowerShell script in Files\', 'MSIX / AppX (remove provisioned + installed)', 'Custom PowerShell (you write the Uninstall phase)', 'None')
+$script:UninstallTypeLabels= @('MSI product code (Start-ADTMsiProcess)', 'Installed app by name (registered uninstaller)', 'Uninstaller EXE on the device (Start-ADTProcess)', 'Script in Files\ (.ps1, .cmd, .bat, .vbs)', 'MSIX / AppX (remove provisioned + installed)', 'Custom PowerShell (you write the Uninstall phase)', 'None')
 $script:DetectTypeCodes    = @('MSI', 'Registry', 'File', 'MSIX', 'Script')
 $script:DetectTypeLabels   = @('MSI product code in Uninstall registry', 'Uninstall registry entry by DisplayName', 'File exists (optionally version)', 'MSIX / AppX package', 'Custom script (paste your own)')
 $script:MatchModeCodes     = @('Exact', 'Wildcard', 'Regex')
@@ -98,7 +143,7 @@ $script:MinOsCodes         = @('v10_1607', 'v10_1703', 'v10_1709', 'v10_1803', '
 $script:MinOsLabels        = @('Windows 10 1607', 'Windows 10 1703', 'Windows 10 1709', 'Windows 10 1803', 'Windows 10 1809', 'Windows 10 1903', 'Windows 10 1909', 'Windows 10 2004', 'Windows 10 20H2', 'Windows 10 21H1 or later')
 $script:ArchChoicesIntune  = @('', 'x64', 'x86,x64', 'x86', 'arm64')
 # Tried in the sandbox, after the current arguments and the detected engine's preset. Order = most common first.
-$script:GenericSilentCandidates = @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-', '/quiet /norestart', '/silent', '/s', '/qn /norestart', '-silent', '--silent', '/q', '-q', '/s /v"/qn REBOOT=ReallySuppress"', '/exenoui /qn', '/passive /norestart', '-y', '--mode unattended')
+$script:GenericSilentCandidates = @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-', '/quiet /norestart', '/silent', '/silent /install','/s', '/qn /norestart', '-silent', '--silent', '/q', '-q', '/s /v"/qn REBOOT=ReallySuppress"', '/exenoui /qn', '/passive /norestart', '-y', '--mode unattended')
 # Tokens looked for as literal strings inside an EXE; a hit promotes the matching candidate.
 $script:SwitchVocabulary = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/SILENT', '/NORESTART', '/quiet', '/passive', '/norestart', '/qn', '/exenoui', '--silent', '-silent', '/silent', '--quiet', '--mode', 'unattended', '/unattended', '/S', '/s', '-q', '-y', '/q', '-i silent', '--confirm-command', '--accept-licenses', '-overwrite')
 $script:GraphToken         = $null
@@ -110,6 +155,7 @@ $script:SilentPresets = [ordered]@{
     'InstallShield'     = @{ Label = 'InstallShield';          Install = '/s /v"/qn REBOOT=ReallySuppress"';               Uninstall = '/s /x /v"/qn REBOOT=ReallySuppress"' }
     'WiX'               = @{ Label = 'WiX Burn bundle';        Install = '/quiet /norestart';                             Uninstall = '/uninstall /quiet /norestart' }
     'Squirrel'          = @{ Label = 'Squirrel (Electron)';    Install = '--silent';                                      Uninstall = '--uninstall -s' }
+    'Omaha'             = @{ Label = 'Omaha / Google Update (Chrome, Brave, Edge)'; Install = '/silent /install';          Uninstall = '--force-uninstall' }
     'InstallAware'      = @{ Label = 'InstallAware';           Install = '/s';                                            Uninstall = '/s MODIFY=FALSE REMOVE=TRUE UNINSTALL=YES' }
     'AdvancedInstaller' = @{ Label = 'Advanced Installer';     Install = '/exenoui /qn';                                  Uninstall = '/x /qn' }
     'MsiWrapper'        = @{ Label = 'msiexec-style wrapper';  Install = '/qn /norestart';                                Uninstall = '/qn /norestart' }
@@ -239,6 +285,11 @@ function Write-Utf8File
     [System.IO.File]::WriteAllText($Path, $Content, $enc)
 }
 
+function Invoke-UiRefresh
+{
+    # Lets long-running work keep the window responsive. Replaced by the GUI's version when the window is open.
+}
+
 #endregion
 
 #region ---------------------------------------------------------------- Definition model
@@ -287,6 +338,7 @@ function New-PackageDefinition
             ApplicationType = 'All'
             File            = ''
             Arguments       = ''
+            SuccessExitCodes = @()   # empty = the Install tab's codes; some uninstallers report success as non-zero (Chromium: 19)
             PackageName     = ''
             PreScript       = ''
             CustomScript    = ''
@@ -403,7 +455,7 @@ function Test-PackageDefinition
         'MSI'    { if (-not "$($u.ProductCode)".Trim() -and -not "$($i.ProductCode)".Trim() -and "$($i.File)" -notmatch '\.msi$') { $problems += 'MSI uninstall needs a product code (or an MSI installer file).' } }
         'Name'   { if (-not "$($u.Name)".Trim()) { $problems += 'Uninstall by name needs the installed application name.' } }
         'EXE'    { if (-not "$($u.File)".Trim()) { $problems += 'EXE uninstall needs the uninstaller path on the device.' } }
-        'Script' { if (-not "$($u.File)".Trim()) { $problems += 'Script uninstall needs a .ps1 file name from the Files list.' } }
+        'Script' { if (-not "$($u.File)".Trim()) { $problems += 'Script uninstall needs a script file name (.ps1, .cmd, .bat or .vbs) from the Files list.' } }
         'MSIX'   { if (-not "$($u.PackageName)".Trim()) { $problems += 'MSIX uninstall needs the package identity name.' } }
         'Custom' { if ([string]::IsNullOrWhiteSpace($u.CustomScript)) { $problems += 'Custom uninstall type needs a custom uninstall script.' } }
     }
@@ -469,13 +521,20 @@ function Get-InstallerEngine
         $len = [int][Math]::Min($fs.Length, 8MB)
         $buf = New-Object byte[] $len
         [void]$fs.Read($buf, 0, $len)
+        # The end of the file too: Omaha writes its tag into the signature block of even a 150 MB standalone installer.
+        $tailLen = [int][Math]::Min([Math]::Max(0, $fs.Length - $len), 256KB)
+        $tail = New-Object byte[] $tailLen
+        if ($tailLen -gt 0) { $fs.Position = $fs.Length - $tailLen; [void]$fs.Read($tail, 0, $tailLen) }
     }
     finally { $fs.Dispose() }
     $latin = [System.Text.Encoding]::GetEncoding(28591).GetString($buf)
     $wide  = $latin -replace "`0", ''
+    $end   = [System.Text.Encoding]::GetEncoding(28591).GetString($tail)
     $vi    = (Get-Item -LiteralPath $Path).VersionInfo
     $meta  = "$($vi.FileDescription) $($vi.ProductName) $($vi.Comments) $($vi.InternalName) $($vi.OriginalFilename)"
 
+    # Omaha (Google Update) metainstallers - Chrome, Brave, Edge - before anything else: they carry other engines' strings.
+    if ("$latin$end" -match 'Gact2\.0Omaha|appguid=\{' -or "$($vi.FileDescription)" -match '(?i)\bUpdate Setup$') { return 'Omaha' }
     if ($latin -match 'Inno Setup' -or $wide -match 'Inno Setup')                                   { return 'Inno' }
     if ($latin -match 'Squirrel' -or $wide -match 'Squirrel')                                       { return 'Squirrel' }
     if ($latin -match 'Nullsoft' -or $latin -match 'NSIS Error' -or $wide -match 'Nullsoft')        { return 'NSIS' }
@@ -570,15 +629,140 @@ function Get-AppxManifestInfo
             $pub = "$($identity.Publisher)"
             if ($pub -match '(?:^|,)\s*CN=([^,]+)') { $vendor = $Matches[1].Trim() } else { $vendor = $pub }
         }
+        $arch = "$($identity.ProcessorArchitecture)"
         return [pscustomobject]@{
             PackageName = "$($identity.Name)"
             Version     = "$($identity.Version)"
             Publisher   = "$($identity.Publisher)"
             DisplayName = $display
             Vendor      = $vendor
+            Arch        = $(switch ($arch) { 'x64' { 'x64' } 'x86' { 'x86' } 'arm64' { 'ARM64' } default { '' } })
         }
     }
     finally { $zip.Dispose() }
+}
+
+function Get-MsiTemplate
+{
+    # Summary information Template (PID 7): "x64;1033", "Intel;1033", "Arm64;1033".
+    param([Parameter(Mandatory)][string]$Path)
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try
+    {
+        $si = $installer.GetType().InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($Path, 0))
+        $t  = $si.GetType().InvokeMember('Property', 'GetProperty', $null, $si, @(7))
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($si)
+        return "$t"
+    }
+    catch { return '' }
+    finally { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($installer) }
+}
+
+function Get-PeMachine
+{
+    # x64 / x86 / ARM64 from the PE header. Bootstrappers are often x86 even when they install x64 software.
+    param([Parameter(Mandatory)][string]$Path)
+    try
+    {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try
+        {
+            $br = New-Object System.IO.BinaryReader($fs)
+            if ($br.ReadUInt16() -ne 0x5A4D) { return '' }
+            $fs.Position = 0x3C
+            $fs.Position = $br.ReadInt32()
+            if ($br.ReadUInt32() -ne 0x00004550) { return '' }
+            switch ([int]$br.ReadUInt16())
+            {
+                0x8664  { return 'x64' }
+                0x014C  { return 'x86' }
+                0xAA64  { return 'ARM64' }
+                default { return '' }
+            }
+        }
+        finally { $fs.Dispose() }
+    }
+    catch { return '' }
+}
+
+function Get-ArchFromText
+{
+    # Architecture named in a file or product name ("npp.8.9.Installer.x64.exe", "7-Zip 26.04 (x64 edition)").
+    param([string]$Text)
+    $t = " $Text ".ToLowerInvariant()
+    if ($t -match '[^a-z0-9](arm64|aarch64)[^a-z0-9]')                { return 'ARM64' }
+    if ($t -match '[^a-z0-9](x64|amd64|win64|x86[-_]64|64-?bit)[^a-z0-9]') { return 'x64' }
+    if ($t -match '[^a-z0-9](x86|win32|i386|i686|32-?bit)[^a-z0-9]')   { return 'x86' }
+    return ''
+}
+
+function Get-CleanAppName
+{
+    # "7-Zip 26.04 (x64 edition)" -> "7-Zip"; "Microsoft Visual C++ 2015-2022 Redistributable (x64) - 14.44.35211" ->
+    # "Microsoft Visual C++ 2015-2022 Redistributable"; "Notepad++ (64-bit x64)" -> "Notepad++".
+    param([string]$Name, [string]$Version)
+    $n = ("$Name" -replace '[\u00AE\u2122\u00A9]|\((R|TM|C)\)', '').Trim()
+    if (-not $n) { return '' }
+    $original = $n
+    if ($Version) { $n = $n.Replace($Version, ' ') }
+    $n = $n -replace '(?<![\w.])v?\d+(?:\.\d+){1,3}(?![\w.])', ' '
+    $n = $n -replace '(?i)[\(\[]\s*(x64|x86|amd64|arm64|win64|64-bit|32-bit)(\s+edition)?\s*[\)\]]', ' '
+    $n = $n -replace '(?i)(?<![\w-])(x64|x86|amd64|arm64|win64|64-bit|32-bit)(?![\w-])', ' '
+    $n = $n -replace '\(\s*\)|\[\s*\]', ' '
+    $n = ($n -replace '\s{2,}', ' ').Trim([char[]]@(' ', '-', '_', ',', ':'))
+    if (-not $n) { return $original }
+    return $n
+}
+
+function Get-CleanVendor
+{
+    # Drops e-mail addresses and URLs (Notepad++: "Don HO don.h@free.fr", WinMerge: "https://winmerge.org"); falls back
+    # to the organisation in the Authenticode signature.
+    param([string]$Text, [string]$Path)
+    $v = ("$Text" -replace '<?[\w.+-]+@[\w-]+(\.[\w-]+)+>?', '') -replace '\s{2,}', ' '
+    $v = $v.Trim([char[]]@(' ', ',', '-', '(', ')'))
+    if ($v -match '^(?i)(https?://|www\.)') { $v = '' }
+    if (-not $v -and $Path)
+    {
+        try
+        {
+            $subject = "$((Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop).SignerCertificate.Subject)"
+            if ($subject -match '(?:^|,\s*)O="?([^",]+)')      { $v = $Matches[1].Trim() }
+            elseif ($subject -match '(?:^|,\s*)CN="?([^",]+)') { $v = $Matches[1].Trim() }
+        }
+        catch { }
+    }
+    return $v
+}
+
+function Get-FileVersionText
+{
+    # Product version from a version resource. The text and the numeric fields can disagree (Notepad++ 8.9.8.1 says
+    # "8.981" as text); the numeric fields win when they do.
+    param($VersionInfo)
+    if (-not $VersionInfo) { return '' }
+    $text = Get-CleanVersion "$($VersionInfo.ProductVersion)"
+    $num  = '{0}.{1}.{2}.{3}' -f $VersionInfo.ProductMajorPart, $VersionInfo.ProductMinorPart, $VersionInfo.ProductBuildPart, $VersionInfo.ProductPrivatePart
+    if ($num -eq '0.0.0.0') { $num = '{0}.{1}.{2}.{3}' -f $VersionInfo.FileMajorPart, $VersionInfo.FileMinorPart, $VersionInfo.FileBuildPart, $VersionInfo.FilePrivatePart }
+    if ($num -eq '0.0.0.0') { $num = '' }
+    if (-not $text) { if ($num) { return $num }; return (Get-CleanVersion "$($VersionInfo.FileVersion)") }
+    if (-not $num) { return $text }
+    $pad = { param($v) $p = @($v.Split('.') | ForEach-Object { [int64]$_ }); while ($p.Count -lt 4) { $p += 0 }; ($p[0..3] -join '.') }
+    if ((& $pad $text) -eq (& $pad $num)) { return $text }
+    return $num
+}
+
+function Split-NameAndVersion
+{
+    # "Contoso Agent 2.1.0" / "contoso_agent_v2.1" / "npp.8.9.8.1.Installer.x64" -> name and version (either may be blank).
+    param([string]$Text)
+    $t = "$Text".Trim()
+    $m = [regex]::Match($t, '^(?<name>.*?)[\s_\-\.]*v?(?<ver>\d+(?:[\._]\d+){1,3})(?=$|[\s_\-\.])')
+    if ($m.Success -and $m.Groups['name'].Value.Trim([char[]]@(' ', '-', '_', '.')))
+    {
+        return @{ Name = ($m.Groups['name'].Value -replace '_', ' ').Trim([char[]]@(' ', '-', '.')); Version = ($m.Groups['ver'].Value -replace '_', '.') }
+    }
+    return @{ Name = ($t -replace '_', ' ').Trim(); Version = '' }
 }
 
 function Get-InstallerInfo
@@ -592,12 +776,14 @@ function Get-InstallerInfo
         Type          = ''
         Vendor        = ''
         Name          = ''
+        RawName       = ''
         Version       = ''
         ProductCode   = ''
         Engine        = ''
         InstallArgs   = ''
         UninstallArgs = ''
         PackageName   = ''
+        Arch          = ''
     }
     switch ($ext)
     {
@@ -605,21 +791,31 @@ function Get-InstallerInfo
         {
             $p = Get-MsiProperties -Path $Path
             $info.Type        = 'MSI'
-            $info.Vendor      = "$($p['Manufacturer'])".Trim()
-            $info.Name        = "$($p['ProductName'])".Trim()
+            $info.Vendor      = Get-CleanVendor -Text "$($p['Manufacturer'])"
+            $info.RawName     = "$($p['ProductName'])".Trim()
             $info.Version     = Get-CleanVersion "$($p['ProductVersion'])"
+            $info.Name        = Get-CleanAppName -Name $info.RawName -Version $info.Version
             $info.ProductCode = "$($p['ProductCode'])".Trim()
             $info.Engine      = 'MSI'
+            $template = Get-MsiTemplate -Path $Path
+            $info.Arch = switch -Regex ($template) { '^(?i)x64' { 'x64' } '^(?i)arm64' { 'ARM64' } '^(?i)intel;' { 'x86' } default { '' } }
+            if (-not $info.Arch) { $info.Arch = Get-ArchFromText "$($info.FileName) $($info.RawName)" }
         }
         '.exe'
         {
             $vi = (Get-Item -LiteralPath $Path).VersionInfo
             $info.Type    = 'EXE'
-            $info.Vendor  = "$($vi.CompanyName)".Trim()
-            $info.Name    = "$($vi.ProductName)".Trim()
-            if (-not $info.Name) { $info.Name = [System.IO.Path]::GetFileNameWithoutExtension($Path) }
-            $info.Version = Get-CleanVersion "$($vi.ProductVersion)"
-            if (-not $info.Version) { $info.Version = Get-CleanVersion "$($vi.FileVersion)" }
+            $info.Vendor  = Get-CleanVendor -Text "$($vi.CompanyName)" -Path $Path
+            $info.RawName = "$($vi.ProductName)".Trim()
+            if (-not $info.RawName) { $info.RawName = "$($vi.FileDescription)".Trim() }
+            $info.Version = Get-FileVersionText $vi
+            $info.Name    = Get-CleanAppName -Name $info.RawName -Version $info.Version
+            if (-not $info.Name -or $info.Name -match '^(?i)(setup|install|installer)$')
+            {
+                $split = Split-NameAndVersion ([System.IO.Path]::GetFileNameWithoutExtension($Path))
+                $info.Name = Get-CleanAppName -Name $split.Name
+                if (-not $info.Version) { $info.Version = $split.Version }
+            }
             $info.Engine  = Get-InstallerEngine -Path $Path
             $preset = $script:SilentPresets[$info.Engine]
             if ($preset)
@@ -627,6 +823,8 @@ function Get-InstallerInfo
                 $info.InstallArgs   = $preset.Install
                 $info.UninstallArgs = $preset.Uninstall
             }
+            $info.Arch = Get-ArchFromText "$($info.FileName) $($info.RawName)"
+            if (-not $info.Arch) { $pe = Get-PeMachine -Path $Path; if ($pe -ne 'x86') { $info.Arch = $pe } }
         }
         { $_ -in @('.msix', '.appx', '.msixbundle', '.appxbundle') }
         {
@@ -634,17 +832,27 @@ function Get-InstallerInfo
             $info.Type        = 'MSIX'
             $info.Vendor      = $m.Vendor
             $info.Name        = $m.DisplayName
+            $info.RawName     = $m.DisplayName
             $info.Version     = $m.Version
             $info.PackageName = $m.PackageName
             $info.Engine      = 'MSIX'
+            $info.Arch        = $m.Arch
         }
-        '.ps1'
+        { $_ -in @('.ps1', '.cmd', '.bat', '.vbs') }
         {
-            $info.Type   = 'Script'
-            $info.Name   = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-            $info.Engine = 'Script'
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+            if ($base -match '^(install|setup|deploy|run|main|start|silent|default|go)([-_ ]?(app|all|script|me|silent|x64|x86))?$')
+            {
+                $base = Split-Path -Path (Split-Path -Path $Path -Parent) -Leaf
+            }
+            $split = Split-NameAndVersion $base
+            $info.Type    = 'Script'
+            $info.Name    = $split.Name
+            $info.RawName = $base
+            $info.Version = $split.Version
+            $info.Engine  = 'Script'
         }
-        default { throw "Unsupported installer type '$ext'. Supported: .msi, .exe, .msix, .appx, .msixbundle, .appxbundle, .ps1" }
+        default { throw "Unsupported installer type '$ext'. Supported: .msi, .exe, .msix, .appx, .msixbundle, .appxbundle, .ps1, .cmd, .bat, .vbs" }
     }
     return $info
 }
@@ -656,6 +864,7 @@ function Set-DefinitionFromInstaller
     if ($Info.Vendor)  { $Def.App.Vendor  = $Info.Vendor }
     if ($Info.Name)    { $Def.App.Name    = $Info.Name }
     if ($Info.Version) { $Def.App.Version = $Info.Version }
+    if ($Info.PSObject.Properties['Arch'] -and $Info.Arch) { $Def.App.Arch = $Info.Arch }
 
     if (@($Def.Sources.Files) -notcontains $Info.Path) { $Def.Sources.Files = @($Def.Sources.Files) + @($Info.Path) }
 
@@ -731,6 +940,51 @@ function New-WelcomeBlock
     return $L
 }
 
+function New-ScriptCallCode
+{
+    # Runs a script from Files\ the right way for its type, from the script's own folder. .ps1 runs in-process (every
+    # PSADT function and $adtSession are available) and a failing exit code fails the deployment; .cmd / .bat / .vbs go
+    # through cmd.exe / cscript.exe with Start-ADTProcess, which applies the success and reboot exit codes.
+    param([Parameter(Mandatory)][string]$File, [string]$Arguments)
+    $file = $File.Trim()
+    $leaf = Split-Path -Path $file -Leaf
+    $argText = "$Arguments".Trim()
+    $L = New-Object System.Collections.Generic.List[string]
+    switch ([System.IO.Path]::GetExtension($file).ToLowerInvariant())
+    {
+        { $_ -in @('.cmd', '.bat') }
+        {
+            $L.Add('$scriptFile = ' + (Get-DirFilesLiteral $file))
+            $L.Add('Start-ADTProcess -FilePath "$env:ComSpec" -ArgumentList (''/c ""{0}"{1}"'' -f $scriptFile, ' + (ConvertTo-PsSingleQuoted $(if ($argText) { " $argText" } else { '' })) + ') -WorkingDirectory (Split-Path -Path $scriptFile -Parent) -WindowStyle Hidden')
+        }
+        '.vbs'
+        {
+            $L.Add('$scriptFile = ' + (Get-DirFilesLiteral $file))
+            $L.Add('Start-ADTProcess -FilePath "$env:SystemRoot\System32\cscript.exe" -ArgumentList (''//nologo //B "{0}"{1}'' -f $scriptFile, ' + (ConvertTo-PsSingleQuoted $(if ($argText) { " $argText" } else { '' })) + ') -WorkingDirectory (Split-Path -Path $scriptFile -Parent) -WindowStyle Hidden')
+        }
+        default
+        {
+            $L.Add('## Runs in-process, so the script can use every PSADT function and $adtSession.')
+            $L.Add('$scriptFile = ' + (Get-DirFilesLiteral $file))
+            $L.Add('Push-Location -LiteralPath (Split-Path -Path $scriptFile -Parent)')
+            $L.Add('try')
+            $L.Add('{')
+            $L.Add('    $global:LASTEXITCODE = 0')
+            $L.Add('    & $scriptFile' + $(if ($argText) { " $argText" } else { '' }))
+            $L.Add('    if ($LASTEXITCODE -and $adtSession.AppSuccessExitCodes -notcontains $LASTEXITCODE -and $adtSession.AppRebootExitCodes -notcontains $LASTEXITCODE)')
+            $L.Add('    {')
+            $L.Add('        throw "' + (ConvertTo-PsExpandableString $leaf) + ' exited with code $LASTEXITCODE."')
+            $L.Add('    }')
+            $L.Add('}')
+            $L.Add('finally')
+            $L.Add('{')
+            $L.Add('    Pop-Location')
+            $L.Add('}')
+        }
+    }
+    return $L
+}
+
 function New-InstallActionCode
 {
     param($Def, [ValidateSet('Install', 'Repair')][string]$Action = 'Install')
@@ -775,10 +1029,7 @@ function New-InstallActionCode
         'Script'
         {
             if ($Action -eq 'Repair') { $L.Add('    ## Repair by re-running the install script.') }
-            $L.Add('    ## Runs in-process, so the script can use every PSADT function and $adtSession.')
-            $line = '    & ' + (Get-DirFilesLiteral $i.File)
-            if ("$($i.Arguments)".Trim()) { $line += ' ' + $i.Arguments.Trim() }
-            $L.Add($line)
+            foreach ($ln in (New-ScriptCallCode -File $i.File -Arguments $i.Arguments)) { $L.Add('    ' + $ln) }
         }
         'MSIX'
         {
@@ -803,6 +1054,12 @@ function New-UninstallActionCode
     $u = $Def.Uninstall
     $i = $Def.Install
     $L = New-Object System.Collections.Generic.List[string]
+    # Extra exit codes that mean the uninstall worked (Chromium's setup.exe: 19) are ignored, not added as success codes:
+    # the toolkit exits with the last success code it saw, and Intune would report an uninstall that exits 19 as failed.
+    $successParam = ''
+    $known = @(@($i.SuccessExitCodes) + @($i.RebootExitCodes) | Where-Object { "$_" -match '^\s*-?\d+\s*$' } | ForEach-Object { [int]$_ })
+    $extraCodes = @($u.SuccessExitCodes | Where-Object { "$_" -match '^\s*-?\d+\s*$' } | ForEach-Object { [int]$_ } | Where-Object { $known -notcontains $_ } | Select-Object -Unique)
+    if ($extraCodes.Count -gt 0) { $successParam = ' -IgnoreExitCodes ' + (ConvertTo-IntArrayLiteral $extraCodes) }
     switch ($u.Type)
     {
         'MSI'
@@ -819,21 +1076,46 @@ function New-UninstallActionCode
         }
         'Name'
         {
-            $line = '    Uninstall-ADTApplication'
-            if ($u.NameIsRegex) { $line += ' -NameMatch ' + (ConvertTo-PsSingleQuoted $u.Name.Trim()) }
+            # The toolkit's own default (Contains) would also remove every other app whose name merely contains this one.
+            $n = $u.Name.Trim()
+            $match = if ($u.NameIsRegex) { 'Regex' } elseif ($n -match '[\*\?]') { 'Wildcard' } else { 'Exact' }
+            $search = '-Name ' + (ConvertTo-PsSingleQuoted $n) + " -NameMatch $match"
+            if ($u.ApplicationType -eq 'EXE')
+            {
+                # Not Uninstall-ADTApplication: it runs the uninstaller from the uninstaller's own folder, and uninstallers
+                # that delete that folder (Chromium's setup.exe) then fail even though the app is gone.
+                $L.Add('    ## Runs the uninstall command the app registered (the quiet one if there is one), from the Windows folder.')
+                $L.Add("    `$apps = Get-ADTApplication $search -ApplicationType EXE")
+                $L.Add('    foreach ($app in $apps)')
+                $L.Add('    {')
+                $L.Add('        $sapParams = @{ FilePath = $app.UninstallStringFilePath; WorkingDirectory = $env:SystemRoot; WindowStyle = ''Hidden'' }')
+                if ("$($u.Arguments)".Trim())
+                {
+                    $L.Add('        if ($app.QuietUninstallStringFilePath) { $sapParams.FilePath = $app.QuietUninstallStringFilePath }')
+                    $L.Add('        $sapParams.ArgumentList = ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim()))
+                }
+                else
+                {
+                    $L.Add('        $argv = $app.UninstallStringArgumentList')
+                    $L.Add('        if ($app.QuietUninstallStringFilePath) { $sapParams.FilePath = $app.QuietUninstallStringFilePath; $argv = $app.QuietUninstallStringArgumentList }')
+                    $L.Add('        if ($argv) { $sapParams.ArgumentList = $argv }')
+                }
+                $L.Add('        Write-ADTLogEntry -Message "Uninstalling [$($app.DisplayName) $($app.DisplayVersion)]."')
+                $L.Add('        Start-ADTProcess @sapParams' + $successParam)
+                $L.Add('    }')
+                $L.Add('    if (-not $apps) { Write-ADTLogEntry -Message ''No installed application matches [' + ($n -replace "'", "''") + ']; nothing to remove.'' -Severity 2 }')
+            }
             else
             {
-                $n = $u.Name.Trim()
-                if ($n -match '[\*\?]') { $line += ' -FilterScript { $_.DisplayName -like ' + (ConvertTo-PsSingleQuoted $n) + ' }' }
-                else                    { $line += ' -Name ' + (ConvertTo-PsSingleQuoted $n) }
+                $line = "    Uninstall-ADTApplication $search"
+                if ($u.ApplicationType -and $u.ApplicationType -ne 'All') { $line += " -ApplicationType $($u.ApplicationType)" }
+                if ("$($u.Arguments)".Trim())
+                {
+                    $L.Add('    ## ArgumentList is used for EXE uninstallers (replaces the arguments in UninstallString); MSI entries get the toolkit defaults.')
+                    $line += ' -ArgumentList ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim())
+                }
+                $L.Add($line + $successParam)
             }
-            if ($u.ApplicationType -and $u.ApplicationType -ne 'All') { $line += " -ApplicationType $($u.ApplicationType)" }
-            if ("$($u.Arguments)".Trim())
-            {
-                $L.Add('    ## ArgumentList is used for EXE uninstallers (replaces the arguments in UninstallString); MSI entries get the toolkit defaults.')
-                $line += ' -ArgumentList ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim())
-            }
-            $L.Add($line)
         }
         'EXE'
         {
@@ -843,7 +1125,7 @@ function New-UninstallActionCode
             $L.Add('    {')
             $line = '        Start-ADTProcess -FilePath $uninstaller'
             if ("$($u.Arguments)".Trim()) { $line += ' -ArgumentList ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim()) }
-            $line += ' -WindowStyle Hidden'
+            $line += ' -WindowStyle Hidden' + $successParam
             $L.Add($line)
             $L.Add('    }')
             $L.Add('    else')
@@ -853,10 +1135,7 @@ function New-UninstallActionCode
         }
         'Script'
         {
-            $L.Add('    ## Runs in-process, so the script can use every PSADT function and $adtSession.')
-            $line = '    & ' + (Get-DirFilesLiteral $u.File.Trim())
-            if ("$($u.Arguments)".Trim()) { $line += ' ' + $u.Arguments.Trim() }
-            $L.Add($line)
+            foreach ($ln in (New-ScriptCallCode -File $u.File -Arguments $u.Arguments)) { $L.Add('    ' + $ln) }
         }
         'MSIX'
         {
@@ -1501,45 +1780,47 @@ function Invoke-PackageBuild
 
 #endregion
 
-#region ---------------------------------------------------------------- Windows Sandbox probe: find silent switches by running the installer
+#region ---------------------------------------------------------------- Windows Sandbox: run installers and packages headlessly as SYSTEM
 
+# Runs inside the sandbox as SYSTEM (wsb exec -r System) - the same account Intune installs with. Everything it touches is
+# thrown away when the sandbox stops. Two modes:
+#   Install  - run one installer command, record what it changed (uninstall entries, folders, shortcuts, registry keys,
+#              services, scheduled tasks), run the detection script, then prove the registered uninstall.
+#   Validate - run a finished PSADT package end to end: install, detect, uninstall, detect again.
 $script:SandboxProbeScript = @'
-# Run-Probe.ps1 - executed inside Windows Sandbox by PSADT Packager. Everything here is thrown away when the sandbox closes.
-# Reads C:\Probe\config.json, writes C:\Probe\result.json and C:\Probe\probe.log (C:\Probe is the host's run folder).
+# Run-Probe.ps1 - executed inside Windows Sandbox by PSADT Packager. Reads C:\Probe\config.json, writes
+# C:\Probe\result.json and C:\Probe\probe.log (C:\Probe is the host's run folder; C:\Source is the read-only input).
 $ErrorActionPreference = 'Continue'
-$probeDir  = 'C:\Probe'
-$srcDir    = 'C:\Installer'
-$workDir   = 'C:\Work'
-$logPath   = Join-Path $probeDir 'probe.log'
-$resultPath= Join-Path $probeDir 'result.json'
+$ProgressPreference    = 'SilentlyContinue'
+$probeDir   = 'C:\Probe'
+$srcDir     = 'C:\Source'
+$workDir    = 'C:\Work'
+$logPath    = Join-Path $probeDir 'probe.log'
+$resultPath = Join-Path $probeDir 'result.json'
 
 function Write-ProbeLog([string]$Message)
 {
     $line = '[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message
-    Add-Content -LiteralPath $logPath -Value $line
-    Write-Host $line
+    Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
 }
 
 $result = [ordered]@{
-    Candidate        = ''
+    Mode             = ''
+    Label            = ''
     Started          = (Get-Date).ToString('s')
     Help             = $null
     Install          = $null
     InstallSucceeded = $false
     NewEntries       = @()
+    PrimaryEntry     = $null
+    Footprint        = $null
     Detection        = $null
     Uninstall        = $null
+    Validation       = $null
     Error            = $null
 }
 
-try
-{
-    $cfg = Get-Content -LiteralPath (Join-Path $probeDir 'config.json') -Raw | ConvertFrom-Json
-    $result.Candidate = "$($cfg.Candidate)"
-    Write-ProbeLog "Probe started. Candidate: [$($cfg.Candidate)]"
-
-    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-    Add-Type -TypeDefinition @"
+Add-Type -TypeDefinition @"
 using System;
 using System.Text;
 using System.Collections.Generic;
@@ -1547,414 +1828,945 @@ using System.Runtime.InteropServices;
 public static class ProbeWin
 {
     public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-    public static List<KeyValuePair<uint, long>> VisibleWindows()
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc f, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, StringBuilder l, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr h, int index);
+    const uint WM_GETTEXT = 0x000D;
+    const uint WM_GETTEXTLENGTH = 0x000E;
+    const uint SMTO_ABORTIFHUNG = 0x0002;
+
+    // The window's own WS_VISIBLE bit: set by ShowWindow even on SYSTEM's non-interactive desktop (where
+    // IsWindowVisible is false for everything). Quiet-mode UIs (WiX Burn) build their window but never show it.
+    public static bool Shown(long handle)
     {
-        var list = new List<KeyValuePair<uint, long>>();
-        EnumWindows((h, l) => { if (IsWindowVisible(h)) { uint pid; GetWindowThreadProcessId(h, out pid); list.Add(new KeyValuePair<uint, long>(pid, h.ToInt64())); } return true; }, IntPtr.Zero);
+        return (GetWindowLong32(new IntPtr(handle), -16) & 0x10000000) != 0;
+    }
+
+    // WM_GETTEXT works across processes (GetWindowText does not for controls), and on the non-interactive desktop.
+    public static string Text(IntPtr h)
+    {
+        IntPtr len;
+        if (SendMessageTimeout(h, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 500, out len) == IntPtr.Zero) return "";
+        long n = len.ToInt64();
+        if (n <= 0) return "";
+        if (n > 8192) n = 8192;
+        var sb = new StringBuilder((int)n + 1);
+        IntPtr r;
+        SendMessageTimeout(h, WM_GETTEXT, new IntPtr(sb.Capacity), sb, SMTO_ABORTIFHUNG, 500, out r);
+        return sb.ToString();
+    }
+
+    public static string ClassOf(IntPtr h)
+    {
+        var sb = new StringBuilder(256);
+        GetClassName(h, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    // Top-level windows as "pid|handle|class|title". SYSTEM runs on a non-interactive desktop, so nothing is ever
+    // visible there; visibility is not checked.
+    public static List<string> TopWindows()
+    {
+        var list = new List<string>();
+        EnumWindows(delegate (IntPtr h, IntPtr l) {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            list.Add(pid.ToString() + "|" + h.ToInt64().ToString() + "|" + ClassOf(h) + "|" + Text(h));
+            return true;
+        }, IntPtr.Zero);
         return list;
     }
-    public static string Title(long hWnd)
+
+    public static List<string> ChildTexts(long handle)
     {
-        IntPtr h = new IntPtr(hWnd);
-        int n = GetWindowTextLength(h);
-        var sb = new StringBuilder(n + 1);
-        GetWindowText(h, sb, sb.Capacity);
-        return sb.ToString();
+        var list = new List<string>();
+        EnumChildWindows(new IntPtr(handle), delegate (IntPtr h, IntPtr l) {
+            string t = Text(h);
+            if (!string.IsNullOrEmpty(t)) list.Add(t);
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    // A window that waits for a person has controls: a button, or several labelled controls (message boxes, wizards).
+    // Helper windows (WiX Burn's quiet-mode window, message pumps) have none.
+    public static bool LooksInteractive(long handle)
+    {
+        int buttons = 0, texts = 0;
+        EnumChildWindows(new IntPtr(handle), delegate (IntPtr h, IntPtr l) {
+            if (ClassOf(h).IndexOf("Button", StringComparison.OrdinalIgnoreCase) >= 0) buttons++;
+            if (!string.IsNullOrEmpty(Text(h))) texts++;
+            return true;
+        }, IntPtr.Zero);
+        return buttons > 0 || texts >= 2;
     }
 }
 "@
 
-    function Get-ProcessTree([int]$RootPid)
+# Helper windows every GUI process owns; they say nothing about whether an installer is waiting for input.
+$IgnoredWindowClasses = @('IME', 'MSCTFIME UI', 'GDI+ Hook Window Class', 'OleMainThreadWndClass', 'CicMarshalWndClass', 'tooltips_class32',
+    'ConsoleWindowClass', 'PseudoConsoleWindow', 'ThumbnailDeviceHelperWnd', 'Shell_TrayWnd', 'WorkerW', 'Progman', 'ComboLBox', 'TApplication')
+$IgnoredWindowTitles  = '^(|Default IME|MSCTFIME UI|GDI\+ Window.*|\.NET-BroadcastEventWindow.*|MediaContextNotificationWindow|SystemResourceNotifyWindow|DDE Server Window|OleMainThreadWndName|Task Host Window|WinEventWindow|Hidden Window|Theme manager|BroadcastListenerWindow|UxdService)$'
+
+function Get-ProcessTable
+{
+    $t = @{}
+    foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, KernelModeTime, UserModeTime, ReadTransferCount, WriteTransferCount, OtherTransferCount -ErrorAction SilentlyContinue))
     {
-        $all = @(Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId, ParentProcessId)
-        $ids = New-Object 'System.Collections.Generic.HashSet[int]'
-        [void]$ids.Add($RootPid)
+        $t[[int]$p.ProcessId] = $p
+    }
+    return $t
+}
+
+function Stop-Tree([int[]]$Ids)
+{
+    foreach ($id in $Ids) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+    if ($Ids.Count -gt 0) { Start-Sleep -Seconds 2 }
+}
+
+function Invoke-Monitored
+{
+    # Runs a command and watches its whole process tree. SYSTEM has no visible desktop, so an installer that waits for a
+    # click simply sits there: the run counts as stuck when the tree (plus anything started since, such as the Windows
+    # Installer service) has been idle for UiGraceSec while it owns a window, or for IdleSec without one.
+    param
+    (
+        [string]$FilePath, [string]$Arguments, [string]$WorkingDirectory,
+        [int]$TimeoutSec = 900, [int]$UiGraceSec = 30, [int]$IdleSec = 120,
+        [switch]$CaptureText, [int]$StopAfterSec = 0
+    )
+    $stamp   = [guid]::NewGuid().ToString('N')
+    $outFile = Join-Path $env:TEMP "probe-$stamp.out"
+    $errFile = Join-Path $env:TEMP "probe-$stamp.err"
+    $params  = @{ FilePath = $FilePath; PassThru = $true; RedirectStandardOutput = $outFile; RedirectStandardError = $errFile }
+    if ($WorkingDirectory) { $params.WorkingDirectory = $WorkingDirectory }
+    if ("$Arguments".Trim()) { $params.ArgumentList = $Arguments }
+    $started = Get-Date
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try
+    {
+        $p = Start-Process @params
+        $null = $p.Handle   # cache the handle so ExitCode is still readable after the process exits
+    }
+    catch
+    {
+        return [pscustomobject]@{ ExitCode = $null; DurationSec = 0; WindowTitles = @(); Stuck = $null; TimedOut = $false; StdOut = ''; StdErr = "Could not start: $($_.Exception.Message)"; Text = ''; LeftRunning = @(); StartFailed = $true }
+    }
+
+    $rootId   = $p.Id
+    $tree     = New-Object 'System.Collections.Generic.HashSet[int]'
+    [void]$tree.Add($rootId)
+    $prev     = @{}
+    $idle     = 0.0
+    $titles   = New-Object System.Collections.Generic.List[string]
+    $texts    = New-Object System.Collections.Generic.List[string]
+    $stuck    = $null
+    $timedOut = $false
+    $rootExit = $null
+    $left     = @()
+    $last     = 0.0
+    $nextBeat = 30
+    while ($true)
+    {
+        Start-Sleep -Milliseconds 2000
+        $now = $sw.Elapsed.TotalSeconds
+        $dt  = [Math]::Max(0.5, $now - $last)
+        $last = $now
+        $table = Get-ProcessTable
+
+        # Grow the tree: anything started since the run began whose parent is in it (the parent may already be gone).
         do
         {
             $added = $false
-            foreach ($p in $all)
+            foreach ($kv in $table.GetEnumerator())
             {
-                if ($ids.Contains([int]$p.ParentProcessId) -and -not $ids.Contains([int]$p.ProcessId)) { [void]$ids.Add([int]$p.ProcessId); $added = $true }
+                $id = [int]$kv.Key
+                if (-not $tree.Contains($id) -and $tree.Contains([int]$kv.Value.ParentProcessId) -and $kv.Value.CreationDate -ge $started)
+                {
+                    [void]$tree.Add($id); $added = $true
+                }
             }
         } while ($added)
-        return @($ids)
-    }
+        $alive = @($tree | Where-Object { $table.ContainsKey($_) })
 
-    function Get-TreeWindows([int[]]$Pids)
-    {
-        $out = @()
-        foreach ($kv in [ProbeWin]::VisibleWindows())
+        # Activity of the tree plus anything else started since the run began (msiexec service, TrustedInstaller ...).
+        $cpu = 0.0; $io = 0.0
+        foreach ($kv in $table.GetEnumerator())
         {
-            if ($Pids -contains [int]$kv.Key)
+            $id = [int]$kv.Key
+            $pr = $kv.Value
+            if ($id -eq $PID -or $pr.Name -match '^(WmiPrvSE|conhost)\.exe$') { continue }
+            if (-not ($tree.Contains($id) -or $pr.CreationDate -ge $started)) { continue }
+            $c = [double]$pr.KernelModeTime + [double]$pr.UserModeTime
+            $i = [double]$pr.ReadTransferCount + [double]$pr.WriteTransferCount + [double]$pr.OtherTransferCount
+            if ($prev.ContainsKey($id)) { $cpu += [Math]::Max(0, $c - $prev[$id].Cpu); $io += [Math]::Max(0, $i - $prev[$id].Io) }
+            else { $cpu += $c; $io += $i }
+            $prev[$id] = @{ Cpu = $c; Io = $i }
+        }
+        $cpuMs  = $cpu / 10000.0
+        $active = ($cpuMs -gt (25 * $dt)) -or ($io -gt (65536 * $dt))
+        if ($active) { $idle = 0.0 } else { $idle += $dt }
+
+        # Windows owned by the tree (helper windows filtered out). Only ones that look like they wait for a person count
+        # towards "stuck"; WPF and Chromium-based UIs draw their controls themselves, so their class gives them away.
+        $dialogs = New-Object System.Collections.Generic.List[string]
+        $windows = New-Object System.Collections.Generic.List[string]
+        foreach ($w in [ProbeWin]::TopWindows())
+        {
+            $parts = $w.Split('|', 4)
+            if (-not $tree.Contains([int]$parts[0])) { continue }
+            if ($IgnoredWindowClasses -contains $parts[2] -or $parts[3] -match $IgnoredWindowTitles) { continue }
+            $shown = [ProbeWin]::Shown([int64]$parts[1])
+            $label = "$($parts[3]) [$($parts[2])$(if (-not $shown) { ', hidden' })]"
+            if (-not $titles.Contains($label)) { $titles.Add($label) }
+            $windows.Add($parts[1])
+            if ($shown -and ([ProbeWin]::LooksInteractive([int64]$parts[1]) -or $parts[2] -match '^(HwndWrapper|Chrome_WidgetWin|#32770$)')) { $dialogs.Add($parts[1]) }
+        }
+        if ($CaptureText)
+        {
+            foreach ($h in $windows) { foreach ($t in [ProbeWin]::ChildTexts([int64]$h)) { if (-not $texts.Contains($t)) { $texts.Add($t) } } }
+        }
+
+        # A heartbeat for long installs, so the packager's log shows the run is alive and what it is doing.
+        if ($StopAfterSec -eq 0 -and $now -ge $nextBeat)
+        {
+            $busy = @(@($alive | ForEach-Object { if ($table.ContainsKey($_)) { "$($table[$_].Name)" } }) +
+                      @($table.Values | Where-Object { $_.CreationDate -ge $started -and $_.Name -match '^(msiexec|TiWorker|TrustedInstaller)\.exe$' } | ForEach-Object { "$($_.Name)" })) | Select-Object -Unique
+            Write-ProbeLog ("Still running after {0}:{1:00} - {2}; {3}" -f [int][Math]::Floor($now / 60), [int]($now % 60), ($busy -join ', '), $(if ($active) { 'working' } else { "quiet for $([int]$idle)s" }))
+            $nextBeat += 30
+        }
+
+        $rootAlive = -not $p.HasExited
+        if ($StopAfterSec -gt 0 -and ($now -ge $StopAfterSec -or ($dialogs.Count -gt 0 -and $idle -ge 4))) { break }
+        if ($rootAlive)
+        {
+            if ($dialogs.Count -gt 0 -and $idle -ge $UiGraceSec)
             {
-                $t = [ProbeWin]::Title($kv.Value)
-                if ($t) { $out += [pscustomobject]@{ Pid = [int]$kv.Key; Handle = [int64]$kv.Value; Title = $t } }
+                # Say what the dialog says (an error, a licence, a question), not just its title; buttons left out.
+                $current = @($titles | Select-Object -Last 3) -join ' | '
+                $said = @(foreach ($h in $dialogs) { [ProbeWin]::ChildTexts([int64]$h) }) | Where-Object { $_ -and $_.Trim().Length -gt 3 -and $_.Trim() -notmatch '^(?i)&?(OK|Cancel|Close|Yes|No|Next\s*>?|Install|Retry|Finish|Browse\.*|I Agree|Accept)$|^<\s*&?Back$' } | Select-Object -Unique
+                $saidText = ((@($said) -join ' / ') -replace '\s+', ' ').Trim()
+                if ($saidText.Length -gt 220) { $saidText = $saidText.Substring(0, 217) + '...' }
+                $stuck = "waiting on a window ($current)$(if ($saidText) { ': "' + $saidText + '"' }) with no activity for $([int]$idle)s"
+                break
+            }
+            if ($idle -ge $IdleSec) { $stuck = "no activity for $([int]$idle)s"; break }
+        }
+        else
+        {
+            if ($null -eq $rootExit) { $rootExit = $now }
+            $others = @($alive | Where-Object { $_ -ne $rootId })
+            if ($others.Count -eq 0) { break }
+            # The installer exited but left children: wait while they work, but an app the installer launched at the end
+            # (the program itself, a tray icon) must not hold the run forever.
+            if ((-not $active -and ($now - $rootExit) -ge 20) -or ($now - $rootExit) -ge 300)
+            {
+                $left = @($others | ForEach-Object { if ($table.ContainsKey($_)) { "$($table[$_].Name)" } } | Select-Object -Unique)
+                break
             }
         }
-        return $out
+        if ($now -ge $TimeoutSec) { $timedOut = $true; break }
     }
 
-    function Get-WindowText([int64]$Handle)
+    $remaining = @($tree | Where-Object { (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+    Stop-Tree $remaining
+    [void]$p.WaitForExit(5000)
+    $exit = $null
+    if ($p.HasExited) { try { $exit = $p.ExitCode } catch { } }
+    $so = ''; $se = ''
+    try { if (Test-Path -LiteralPath $outFile) { $so = Get-Content -LiteralPath $outFile -Raw } } catch { }
+    try { if (Test-Path -LiteralPath $errFile) { $se = Get-Content -LiteralPath $errFile -Raw } } catch { }
+    Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{
+        ExitCode     = $exit
+        DurationSec  = [int]$sw.Elapsed.TotalSeconds
+        WindowTitles = @($titles)
+        Stuck        = $stuck
+        TimedOut     = $timedOut
+        StdOut       = "$so".Trim()
+        StdErr       = "$se".Trim()
+        Text         = ($texts -join "`n")
+        LeftRunning  = @($left)
+        StartFailed  = $false
+    }
+}
+
+function Get-UninstallSnapshot
+{
+    $roots = @(
+        @{ Hive = 'LocalMachine'; View = 'Registry64' },
+        @{ Hive = 'LocalMachine'; View = 'Registry32' },
+        @{ Hive = 'CurrentUser';  View = 'Default' }
+    )
+    $entries = @{}
+    foreach ($r in $roots)
     {
         try
         {
-            $el  = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Handle)
-            $all = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-            $parts = New-Object System.Collections.Generic.List[string]
-            foreach ($e in $all) { $n = "$($e.Current.Name)".Trim(); if ($n -and -not $parts.Contains($n)) { $parts.Add($n) } }
-            return ($parts -join "`n")
-        }
-        catch { return '' }
-    }
-
-    function Stop-ProcessTree([int]$RootPid)
-    {
-        foreach ($id in (Get-ProcessTree $RootPid)) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
-        Start-Sleep -Seconds 2
-    }
-
-    function Invoke-Monitored
-    {
-        # Runs a command and watches its whole process tree for windows. A window that stays for longer than the grace
-        # period means the run is not silent; the tree is killed and that is reported.
-        param([string]$File, [string]$Arguments, [int]$TimeoutSec, [int]$UiGraceSec, [switch]$CaptureUi)
-        $stamp   = [guid]::NewGuid().ToString('N')
-        $outFile = Join-Path $env:TEMP "probe-$stamp.out"
-        $errFile = Join-Path $env:TEMP "probe-$stamp.err"
-        $params  = @{ FilePath = $File; PassThru = $true; WorkingDirectory = (Split-Path -Path $File -Parent); RedirectStandardOutput = $outFile; RedirectStandardError = $errFile }
-        if ("$Arguments".Trim()) { $params.ArgumentList = $Arguments }
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        try { $p = Start-Process @params }
-        catch { return [pscustomobject]@{ ExitCode = $null; DurationSec = 0; WindowTitles = @(); UiPersisted = $false; TimedOut = $false; StdOut = ''; StdErr = "Could not start: $($_.Exception.Message)"; UiText = ''; StartFailed = $true } }
-
-        $firstUi = $null; $titles = @{}; $uiText = ''; $timedOut = $false; $uiPersisted = $false
-        while (-not $p.HasExited)
-        {
-            Start-Sleep -Milliseconds 1000
-            $wins = Get-TreeWindows -Pids (Get-ProcessTree $p.Id)
-            if ($wins.Count -gt 0)
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]$r.Hive, [Microsoft.Win32.RegistryView]$r.View)
+            $key  = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+            if (-not $key) { continue }
+            foreach ($name in $key.GetSubKeyNames())
             {
-                if (-not $firstUi) { $firstUi = Get-Date }
-                foreach ($w in $wins)
-                {
-                    $titles[$w.Title] = $true
-                    if ($CaptureUi) { $t = Get-WindowText $w.Handle; if ($t.Length -gt $uiText.Length) { $uiText = $t } }
+                $sub = $key.OpenSubKey($name)
+                if (-not $sub) { continue }
+                $id = "$($r.Hive)\$($r.View)\$name"
+                # Windows adds this itself when it shims a setup program; it is not part of the app.
+                if ([string]$sub.GetValue('DisplayName') -like 'Microsoft Windows Application Compatibility*') { $sub.Close(); continue }
+                $entries[$id] = [pscustomobject]@{
+                    Id                   = $id
+                    KeyName              = $name
+                    Location             = "$($r.Hive)\$($r.View)"
+                    DisplayName          = [string]$sub.GetValue('DisplayName')
+                    DisplayVersion       = [string]$sub.GetValue('DisplayVersion')
+                    Publisher            = [string]$sub.GetValue('Publisher')
+                    UninstallString      = [string]$sub.GetValue('UninstallString')
+                    QuietUninstallString = [string]$sub.GetValue('QuietUninstallString')
+                    InstallLocation      = [string]$sub.GetValue('InstallLocation')
+                    DisplayIcon          = [string]$sub.GetValue('DisplayIcon')
+                    SystemComponent      = [int]($sub.GetValue('SystemComponent', 0))
+                    WindowsInstaller     = [int]($sub.GetValue('WindowsInstaller', 0))
                 }
-                if (((Get-Date) - $firstUi).TotalSeconds -ge $UiGraceSec) { $uiPersisted = $true; break }
+                $sub.Close()
             }
-            else { $firstUi = $null }
-            if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; break }
-            $p.Refresh()
+            $key.Close()
         }
-        if (-not $p.HasExited) { Stop-ProcessTree $p.Id }
-        [void]$p.WaitForExit(5000)
-        $exit = $null
-        try { $exit = $p.ExitCode } catch { }
-        $so = ''; $se = ''
-        try { if (Test-Path $outFile) { $so = Get-Content -LiteralPath $outFile -Raw } } catch { }
-        try { if (Test-Path $errFile) { $se = Get-Content -LiteralPath $errFile -Raw } } catch { }
-        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
-        return [pscustomobject]@{
-            ExitCode     = $exit
-            DurationSec  = [int]$sw.Elapsed.TotalSeconds
-            WindowTitles = @($titles.Keys)
-            UiPersisted  = $uiPersisted
-            TimedOut     = $timedOut
-            StdOut       = "$so".Trim()
-            StdErr       = "$se".Trim()
-            UiText       = $uiText
-            StartFailed  = $false
-        }
+        catch { }
     }
+    return $entries
+}
 
-    function Get-UninstallSnapshot
+$SystemProfile = Join-Path $env:SystemRoot 'System32\config\systemprofile'
+
+function Get-FootprintSnapshot
+{
+    # Names only - enough to diff before/after cheaply.
+    $dirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $deep = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Join-Path $SystemProfile 'AppData\Local'), (Join-Path $SystemProfile 'AppData\Roaming'), (Join-Path $SystemProfile 'AppData\Local\Programs'))
+    foreach ($root in $deep)
     {
-        $roots = @(
-            @{ Hive = 'LocalMachine'; View = 'Registry64' },
-            @{ Hive = 'LocalMachine'; View = 'Registry32' },
-            @{ Hive = 'CurrentUser';  View = 'Default' }
-        )
-        $entries = @{}
-        foreach ($r in $roots)
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue))
         {
-            try
-            {
-                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]$r.Hive, [Microsoft.Win32.RegistryView]$r.View)
-                $key  = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
-                if (-not $key) { continue }
-                foreach ($name in $key.GetSubKeyNames())
-                {
-                    $sub = $key.OpenSubKey($name)
-                    if (-not $sub) { continue }
-                    $id = "$($r.Hive)\$($r.View)\$name"
-                    $entries[$id] = [pscustomobject]@{
-                        Id                   = $id
-                        KeyName              = $name
-                        Location             = "$($r.Hive)\$($r.View)"
-                        DisplayName          = [string]$sub.GetValue('DisplayName')
-                        DisplayVersion       = [string]$sub.GetValue('DisplayVersion')
-                        Publisher            = [string]$sub.GetValue('Publisher')
-                        UninstallString      = [string]$sub.GetValue('UninstallString')
-                        QuietUninstallString = [string]$sub.GetValue('QuietUninstallString')
-                        InstallLocation      = [string]$sub.GetValue('InstallLocation')
-                        DisplayIcon          = [string]$sub.GetValue('DisplayIcon')
-                        SystemComponent      = [int]($sub.GetValue('SystemComponent', 0))
-                    }
-                    $sub.Close()
-                }
-                $key.Close()
-            }
-            catch { }
+            [void]$dirs.Add($d.FullName)
+            foreach ($d2 in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction SilentlyContinue)) { [void]$dirs.Add($d2.FullName) }
         }
-        return $entries
     }
+    foreach ($d in @(Get-ChildItem -LiteralPath 'C:\' -Directory -Force -ErrorAction SilentlyContinue)) { [void]$dirs.Add($d.FullName) }
 
-    function Split-CommandLine([string]$Command)
+    $links = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
+    foreach ($f in @(Get-ChildItem -LiteralPath $startMenu -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.lnk', '.url') })) { [void]$links.Add($f.FullName) }
+    foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $env:PUBLIC 'Desktop') -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq '.lnk' })) { [void]$links.Add($f.FullName) }
+
+    $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($root in @('SOFTWARE', 'SOFTWARE\WOW6432Node'))
     {
-        # "C:\path\unins000.exe" /SILENT   |   C:\path\uninstall.exe --silent   |   MsiExec.exe /X{GUID}
-        $c = "$Command".Trim()
-        if ($c -match '^"([^"]+)"\s*(.*)$') { return @{ File = $Matches[1]; Args = $Matches[2].Trim() } }
-        $m = [regex]::Match($c, '^(.+?\.exe)\s*(.*)$', 'IgnoreCase')
-        if ($m.Success) { return @{ File = $m.Groups[1].Value.Trim(); Args = $m.Groups[2].Value.Trim() } }
-        $parts = $c -split '\s+', 2
-        return @{ File = $parts[0]; Args = $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) }
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($root)
+        if (-not $k) { continue }
+        foreach ($n in $k.GetSubKeyNames())
+        {
+            [void]$keys.Add("HKLM\$root\$n")
+            if ($n -in @('Classes', 'WOW6432Node', 'Microsoft')) { continue }
+            $sub = $k.OpenSubKey($n)
+            if ($sub) { foreach ($n2 in $sub.GetSubKeyNames()) { [void]$keys.Add("HKLM\$root\$n\$n2") }; $sub.Close() }
+        }
+        $k.Close()
     }
 
-    # ---- Stage the installer on the sandbox's own disk (some installers write next to themselves).
+    $services = @{}
+    foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Property Name, DisplayName, PathName -ErrorAction SilentlyContinue)) { $services[$s.Name] = $s }
+    $tasks = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) { [void]$tasks.Add("$($t.TaskPath)$($t.TaskName)") }
+    return @{ Dirs = $dirs; Links = $links; Keys = $keys; Services = $services; Tasks = $tasks }
+}
+
+$NoiseDirs = '^(C:\\(Windows|Users|Work|Probe|Source|Config\.Msi|\$Recycle\.Bin|\$WinREAgent|System Volume Information|Recovery|PerfLogs|Program Files|Program Files \(x86\)|ProgramData)$)' +
+    '|^C:\\ProgramData\\(Microsoft|Package Cache|regid\.[^\\]*|USOShared|USOPrivate|Packages|ssh|SoftwareDistribution)(\\|$)' +
+    '|^C:\\Program Files( \(x86\))?\\(WindowsApps|ModifiableWindowsApps|Windows Defender[^\\]*|Windows Security|Microsoft Update Health Tools|Common Files\\microsoft shared)(\\|$)' +
+    '|\\AppData\\(Local|Roaming)\\(Microsoft|Temp|Packages|ConnectedDevicesPlatform|D3DSCache|PeerDistRepub|AMD|ATI|NVIDIA|NVIDIA Corporation|Intel|IntelGraphicsProfiles)(\\|$)'
+$NoiseKeys = '^HKLM\\SOFTWARE\\(WOW6432Node\\)?(Microsoft|Classes|Policies|RegisteredApplications|Clients|WOW6432Node|DefaultUserEnvironment|Intel)(\\|$)'
+
+function Get-ExeInfo([string]$Path)
+{
+    $vi = $null
+    try { $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo } catch { }
+    $ver = ''
+    if ($vi) { $ver = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart; if ($ver -eq '0.0.0.0') { $ver = "$($vi.FileVersion)".Trim() } }
+    $machine = ''
+    try
+    {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try
+        {
+            $br = New-Object System.IO.BinaryReader($fs)
+            if ($br.ReadUInt16() -eq 0x5A4D)
+            {
+                $fs.Position = 0x3C; $fs.Position = $br.ReadInt32()
+                if ($br.ReadUInt32() -eq 0x00004550) { $machine = switch ([int]$br.ReadUInt16()) { 0x8664 { 'x64' } 0x014C { 'x86' } 0xAA64 { 'ARM64' } default { '' } } }
+            }
+        }
+        finally { $fs.Dispose() }
+    }
+    catch { }
+    return [ordered]@{
+        Path            = $Path
+        Machine         = $machine
+        FileVersion     = $ver
+        ProductVersion  = $(if ($vi) { "$($vi.ProductVersion)".Trim() } else { '' })
+        ProductName     = $(if ($vi) { "$($vi.ProductName)".Trim() } else { '' })
+        FileDescription = $(if ($vi) { "$($vi.FileDescription)".Trim() } else { '' })
+        CompanyName     = $(if ($vi) { "$($vi.CompanyName)".Trim() } else { '' })
+        Size            = (Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue).Length
+    }
+}
+
+function Compare-Footprint($Before, $After)
+{
+    # New folders: keep only the top-most new one of each branch, drop known noise.
+    $newDirs = @($After.Dirs | Where-Object { -not $Before.Dirs.Contains($_) })
+    $top = @($newDirs | Where-Object { $parent = Split-Path -Path $_ -Parent; -not ($newDirs -contains $parent) })
+    $folders = New-Object System.Collections.Generic.List[object]
+    $cache   = New-Object System.Collections.Generic.List[string]
+    foreach ($d in ($top | Sort-Object))
+    {
+        if ($d -match '^C:\\ProgramData\\Package Cache\\') { $cache.Add($d); continue }
+        if ($d -match $NoiseDirs) { continue }
+        $exes = @(Get-ChildItem -LiteralPath $d -Recurse -Depth 4 -File -Filter '*.exe' -Force -ErrorAction SilentlyContinue | Select-Object -First 40 | ForEach-Object { Get-ExeInfo $_.FullName })
+        $folders.Add([ordered]@{ Path = $d; PerUser = ($d -like "$SystemProfile\*"); Exes = $exes })
+    }
+    $shell = $null
+    try { $shell = New-Object -ComObject WScript.Shell } catch { }
+    $links = @($After.Links | Where-Object { -not $Before.Links.Contains($_) } | ForEach-Object {
+        $target = ''; $lnkArgs = ''
+        if ($shell -and $_ -like '*.lnk') { try { $s = $shell.CreateShortcut($_); $target = $s.TargetPath; $lnkArgs = $s.Arguments } catch { } }
+        [ordered]@{ Path = $_; Target = $target; Arguments = $lnkArgs }
+    })
+    $newKeys = @($After.Keys | Where-Object { -not $Before.Keys.Contains($_) })
+    $keys = @($newKeys | Where-Object { $parent = $_.Substring(0, $_.LastIndexOf('\')); -not ($newKeys -contains $parent) -and $_ -notmatch $NoiseKeys } | Sort-Object)
+    $services = @($After.Services.Keys | Where-Object { -not $Before.Services.ContainsKey($_) } | ForEach-Object { $s = $After.Services[$_]; [ordered]@{ Name = $s.Name; DisplayName = $s.DisplayName; PathName = $s.PathName } })
+    $tasks = @($After.Tasks | Where-Object { -not $Before.Tasks.Contains($_) -and $_ -notlike '\Microsoft\*' } | Sort-Object)
+    return [ordered]@{
+        Folders      = $folders.ToArray()
+        Shortcuts    = $links
+        RegistryKeys = $keys
+        Services     = $services
+        Tasks        = $tasks
+        PackageCache = $cache.ToArray()
+        PerUser      = @($folders | Where-Object { $_.PerUser -and @($_.Exes).Count -gt 0 } | ForEach-Object { $_.Path })
+    }
+}
+
+function Test-FootprintEmpty($Fp)
+{
+    return (@($Fp.Folders).Count + @($Fp.Shortcuts).Count + @($Fp.RegistryKeys).Count + @($Fp.Services).Count + @($Fp.Tasks).Count) -eq 0
+}
+
+function Split-CommandLine([string]$Command)
+{
+    # "C:\path\unins000.exe" /SILENT   |   C:\path\uninstall.exe --silent   |   MsiExec.exe /X{GUID}
+    $c = "$Command".Trim()
+    if ($c -match '^"([^"]+)"\s*(.*)$') { return @{ File = $Matches[1]; Args = $Matches[2].Trim() } }
+    $m = [regex]::Match($c, '^(.+?\.exe)\s*(.*)$', 'IgnoreCase')
+    if ($m.Success) { return @{ File = $m.Groups[1].Value.Trim(); Args = $m.Groups[2].Value.Trim() } }
+    $parts = $c -split '\s+', 2
+    return @{ File = $parts[0]; Args = $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) }
+}
+
+function Invoke-Detection([string]$ScriptPath)
+{
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $out = & $psExe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath 2>&1
+    $code = $LASTEXITCODE
+    $text = (@($out) -join ' ').Trim()
+    return [ordered]@{ ExitCode = $code; Output = $text; Detected = ($code -eq 0 -and [bool]$text) }
+}
+
+function Select-Entry($Entries, [string]$Hint)
+{
+    # The uninstall entry that best represents the app (installers sometimes add runtimes alongside).
+    $visible = @($Entries | Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 })
+    if ($visible.Count -eq 0) { return $null }
+    if ($visible.Count -eq 1 -or -not $Hint) { return $visible[0] }
+    $h = $Hint.ToLowerInvariant()
+    $best = $null; $bestScore = -1
+    foreach ($e in $visible)
+    {
+        $n = $e.DisplayName.ToLowerInvariant()
+        $score = 0
+        if ($n -eq $h) { $score += 4 } elseif ($n.StartsWith($h)) { $score += 3 } elseif ($n.Contains($h)) { $score += 2 } elseif ($h.Contains($n)) { $score += 1 }
+        if ($e.QuietUninstallString) { $score += 0.5 }
+        if ($score -gt $bestScore) { $best = $e; $bestScore = $score }
+    }
+    return $best
+}
+
+function Copy-Input($Cfg)
+{
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $srcDir '*') -Destination $workDir -Recurse -Force
-    $exe = Join-Path $workDir $cfg.InstallerName
-    if (-not (Test-Path -LiteralPath $exe)) { throw "Installer not found after copy: $exe" }
-    Write-ProbeLog "Installer: $exe"
-
-    $before = Get-UninstallSnapshot
-    Write-ProbeLog "Uninstall entries before: $($before.Count)"
-
-    # ---- Help probe: what does the installer say about itself?
-    if ($cfg.HelpSwitch)
+    $items = @($Cfg.CopyItems | Where-Object { $_ })
+    if ($items.Count -eq 0) { Copy-Item -Path (Join-Path $srcDir '*') -Destination $workDir -Recurse -Force; return }
+    foreach ($rel in $items)
     {
-        Write-ProbeLog "Help probe: $($cfg.InstallerName) $($cfg.HelpSwitch)"
-        $h = Invoke-Monitored -File $exe -Arguments $cfg.HelpSwitch -TimeoutSec 25 -UiGraceSec 6 -CaptureUi
-        $text = (@($h.StdOut, $h.StdErr, $h.UiText) | Where-Object { $_ }) -join "`n"
-        $result.Help = [ordered]@{ Switch = "$($cfg.HelpSwitch)"; Text = $text; WindowTitles = @($h.WindowTitles); ExitCode = $h.ExitCode }
+        $from = Join-Path $srcDir $rel
+        $to   = Join-Path $workDir $rel
+        $parent = Split-Path -Path $to -Parent
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Copy-Item -LiteralPath $from -Destination $to -Recurse -Force
+    }
+}
+
+function Invoke-InstallMode($Cfg)
+{
+    if ($Cfg.FilePath -match '(?i)\\(cscript|wscript)\.exe$' -and -not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\vbscript.dll')))
+    {
+        throw 'VBScript is not available in this Windows Sandbox: the engine is an optional Windows component that Microsoft is retiring, and the sandbox image does not include it. The script could not be run here.'
+    }
+    Copy-Input $Cfg
+    Write-ProbeLog "Command: `"$($Cfg.FilePath)`" $($Cfg.Arguments)"
+    $beforeEntries = Get-UninstallSnapshot
+    $beforeFp      = Get-FootprintSnapshot
+    Write-ProbeLog "Baseline: $($beforeEntries.Count) uninstall entries, $($beforeFp.Dirs.Count) folders, $($beforeFp.Services.Count) services"
+
+    if ($Cfg.Help -and $Cfg.Help.FilePath)
+    {
+        Write-ProbeLog "Help probe: $($Cfg.Help.Arguments)"
+        $h = Invoke-Monitored -FilePath $Cfg.Help.FilePath -Arguments $Cfg.Help.Arguments -WorkingDirectory $Cfg.WorkingDirectory -TimeoutSec 30 -StopAfterSec 20 -CaptureText
+        $text = (@($h.StdOut, $h.StdErr, $h.Text) | Where-Object { $_ }) -join "`n"
+        $result.Help = [ordered]@{ Switch = "$($Cfg.Help.Arguments)"; Text = $text; WindowTitles = @($h.WindowTitles); ExitCode = $h.ExitCode }
         Write-ProbeLog "Help probe captured $($text.Length) chars, windows: $(@($h.WindowTitles) -join ' | ')"
-        # A help run must not leave anything behind; if it did, note it and carry on.
         $afterHelp = Get-UninstallSnapshot
-        $leak = @($afterHelp.Keys | Where-Object { -not $before.ContainsKey($_) })
-        if ($leak.Count -gt 0) { Write-ProbeLog "Help switch appears to have installed something ($($leak.Count) new entries)"; $before = $afterHelp }
+        $leak = @($afterHelp.Keys | Where-Object { -not $beforeEntries.ContainsKey($_) })
+        if ($leak.Count -gt 0) { Write-ProbeLog "The help switch installed something ($($leak.Count) new entries); re-baselining"; $beforeEntries = $afterHelp; $beforeFp = Get-FootprintSnapshot }
     }
 
-    # ---- The candidate itself.
-    Write-ProbeLog "Install: $($cfg.InstallerName) $($cfg.Candidate)  (timeout $($cfg.TimeoutSec)s, UI grace $($cfg.UiGraceSec)s)"
-    $inst = Invoke-Monitored -File $exe -Arguments $cfg.Candidate -TimeoutSec $cfg.TimeoutSec -UiGraceSec $cfg.UiGraceSec
-    $result.Install = [ordered]@{
-        ExitCode = $inst.ExitCode; DurationSec = $inst.DurationSec; WindowTitles = @($inst.WindowTitles)
-        UiPersisted = $inst.UiPersisted; TimedOut = $inst.TimedOut; StdOut = $inst.StdOut; StdErr = $inst.StdErr; StartFailed = $inst.StartFailed
-    }
-    Write-ProbeLog "Install finished: exit $($inst.ExitCode), $($inst.DurationSec)s, UI persisted: $($inst.UiPersisted), timed out: $($inst.TimedOut)"
-    if ($inst.WindowTitles.Count -gt 0) { Write-ProbeLog "Windows seen: $(@($inst.WindowTitles) -join ' | ')" }
+    $inst = Invoke-Monitored -FilePath $Cfg.FilePath -Arguments $Cfg.Arguments -WorkingDirectory $Cfg.WorkingDirectory -TimeoutSec $Cfg.TimeoutSec -UiGraceSec $Cfg.UiGraceSec -IdleSec $Cfg.IdleSec
+    $result.Install = $inst
+    Write-ProbeLog "Install finished: exit $($inst.ExitCode), $($inst.DurationSec)s$(if ($inst.Stuck) { ", STUCK: $($inst.Stuck)" })$(if ($inst.TimedOut) { ', TIMED OUT' })"
+    if (@($inst.WindowTitles).Count -gt 0) { Write-ProbeLog "Windows seen: $(@($inst.WindowTitles) -join ' | ')" }
+    if (@($inst.LeftRunning).Count -gt 0) { Write-ProbeLog "Left running after the installer exited (stopped): $(@($inst.LeftRunning) -join ', ')" }
 
-    # Some installers hand off to a child and exit 0 immediately; give the registry a moment.
-    Start-Sleep -Seconds 5
-    $after = Get-UninstallSnapshot
-    $new = @($after.Keys | Where-Object { -not $before.ContainsKey($_) } | ForEach-Object { $after[$_] } | Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 })
-    $result.NewEntries = @($new | ForEach-Object { [ordered]@{
-        KeyName = $_.KeyName; Location = $_.Location; DisplayName = $_.DisplayName; DisplayVersion = $_.DisplayVersion; Publisher = $_.Publisher
-        UninstallString = $_.UninstallString; QuietUninstallString = $_.QuietUninstallString; InstallLocation = $_.InstallLocation
-    } })
-    Write-ProbeLog "New uninstall entries: $($new.Count)$(if ($new.Count) { ' - ' + (($new | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)" }) -join ' | ') })"
+    Start-Sleep -Seconds 3
+    $afterEntries = Get-UninstallSnapshot
+    $new = @($afterEntries.Keys | Where-Object { -not $beforeEntries.ContainsKey($_) } | ForEach-Object { $afterEntries[$_] } | Where-Object { $_.DisplayName })
+    $result.NewEntries = $new
+    $primary = Select-Entry $new $Cfg.AppNameHint
+    $result.PrimaryEntry = $primary
+    Write-ProbeLog "New uninstall entries: $($new.Count)$(if ($new.Count) { ' - ' + (($new | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)$(if ($_.SystemComponent -eq 1) { ' (hidden)' })" }) -join ' | ') })"
 
-    # ---- Detection script from the packager.
-    if ($cfg.DetectionScriptBase64)
+    $fp = Compare-Footprint $beforeFp (Get-FootprintSnapshot)
+    $result.Footprint = $fp
+    Write-ProbeLog "Footprint: $(@($fp.Folders).Count) folders, $(@($fp.Shortcuts).Count) shortcuts, $(@($fp.RegistryKeys).Count) registry keys, $(@($fp.Services).Count) services, $(@($fp.Tasks).Count) tasks$(if (@($fp.PerUser).Count) { ', PER-USER: ' + (@($fp.PerUser) -join ', ') })"
+    foreach ($f in @($fp.Folders)) { Write-ProbeLog "  folder $($f.Path) ($(@($f.Exes).Count) exe)" }
+
+    $detPath = $null
+    if ($Cfg.DetectionScriptBase64)
     {
-        $detPath = Join-Path $workDir 'Detect.ps1'
-        [System.IO.File]::WriteAllBytes($detPath, [Convert]::FromBase64String($cfg.DetectionScriptBase64))
-        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $detOut = & $psExe -NoProfile -ExecutionPolicy Bypass -File $detPath 2>&1
-        $result.Detection = [ordered]@{ ExitCode = $LASTEXITCODE; Output = (@($detOut) -join ' ').Trim() }
-        Write-ProbeLog "Detection script: exit $LASTEXITCODE $($result.Detection.Output)"
+        $detPath = Join-Path $workDir 'Detect-Probe.ps1'
+        [System.IO.File]::WriteAllBytes($detPath, [Convert]::FromBase64String($Cfg.DetectionScriptBase64))
+        $result.Detection = Invoke-Detection $detPath
+        Write-ProbeLog "Detection script: exit $($result.Detection.ExitCode) $($result.Detection.Output)"
     }
 
-    $silent = (-not $inst.UiPersisted) -and (-not $inst.TimedOut) -and (-not $inst.StartFailed)
-    $exitOk = $null -ne $inst.ExitCode -and (@($cfg.SuccessCodes) -contains [int]$inst.ExitCode)
-    $evidence = ($new.Count -gt 0) -or ($result.Detection -and $result.Detection.ExitCode -eq 0)
+    $silent   = -not $inst.Stuck -and -not $inst.TimedOut -and -not $inst.StartFailed
+    $exitOk   = $null -ne $inst.ExitCode -and (@($Cfg.SuccessCodes) -contains [int]$inst.ExitCode)
+    $evidence = ($null -ne $primary) -or -not (Test-FootprintEmpty $fp) -or ($result.Detection -and $result.Detection.Detected)
     $result.InstallSucceeded = $silent -and $exitOk -and $evidence
     Write-ProbeLog "Silent: $silent, exit OK: $exitOk, evidence of install: $evidence => succeeded: $($result.InstallSucceeded)"
 
-    # ---- Prove the uninstall too, while we have a machine with the app on it.
-    if ($result.InstallSucceeded -and $new.Count -gt 0)
+    # Prove the registered uninstall while there is a machine with the app on it.
+    if ($result.InstallSucceeded -and $primary -and ($primary.QuietUninstallString -or $primary.UninstallString))
     {
-        $entry = @($new | Where-Object { $_.QuietUninstallString -or $_.UninstallString } | Select-Object -First 1)
-        if ($entry.Count -gt 0)
+        $fromQuiet = [bool]$primary.QuietUninstallString
+        $cmd   = if ($fromQuiet) { $primary.QuietUninstallString } else { $primary.UninstallString }
+        $parts = Split-CommandLine $cmd
+        $file  = $parts.File
+        $uArgs = $parts.Args
+        if ($file -match '(?i)msiexec')
         {
-            $entry = $entry[0]
-            $fromQuiet = [bool]$entry.QuietUninstallString
-            $cmd = if ($fromQuiet) { $entry.QuietUninstallString } else { $entry.UninstallString }
-            $parts = Split-CommandLine $cmd
-            $file = $parts.File; $uArgs = $parts.Args
-            if ($file -match '(?i)msiexec')
-            {
-                # Normalise to a silent MSI uninstall of the same product.
-                $uArgs = ($uArgs -replace '(?i)/I\{', '/X{')
-                if ($uArgs -notmatch '(?i)/q') { $uArgs = "$uArgs /qn /norestart".Trim() }
-            }
-            elseif (-not $fromQuiet -and "$($cfg.UninstallArgs)".Trim())
-            {
-                $uArgs = "$uArgs $($cfg.UninstallArgs)".Trim()
-            }
-            if ($file -notmatch '\\' -and $file -notmatch '(?i)msiexec') { $file = Join-Path $entry.InstallLocation $file }
-            Write-ProbeLog "Uninstall: `"$file`" $uArgs  (from $(if ($fromQuiet) { 'QuietUninstallString' } else { 'UninstallString' }))"
-            $un = Invoke-Monitored -File $file -Arguments $uArgs -TimeoutSec $cfg.TimeoutSec -UiGraceSec $cfg.UiGraceSec
-            Start-Sleep -Seconds 5
-            $final = Get-UninstallSnapshot
-            $gone = -not $final.ContainsKey($entry.Id)
-            $result.Uninstall = [ordered]@{
-                File = $file; Arguments = $uArgs; FromQuietUninstallString = $fromQuiet
-                ExitCode = $un.ExitCode; DurationSec = $un.DurationSec; UiPersisted = $un.UiPersisted; TimedOut = $un.TimedOut
-                WindowTitles = @($un.WindowTitles); EntryRemoved = $gone
-                Verified = ($gone -and -not $un.UiPersisted -and -not $un.TimedOut)
-            }
-            Write-ProbeLog "Uninstall finished: exit $($un.ExitCode), UI persisted: $($un.UiPersisted), entry removed: $gone"
+            $uArgs = ($uArgs -replace '(?i)/I\s*\{', '/X{')
+            if ($uArgs -notmatch '(?i)/q') { $uArgs = "$uArgs /qn /norestart".Trim() }
         }
+        elseif (-not $fromQuiet -and "$($Cfg.UninstallArgs)".Trim())
+        {
+            $uArgs = "$uArgs $($Cfg.UninstallArgs)".Trim()
+        }
+        # A bare name is either a system tool on PATH (powershell.exe, cmd.exe, rundll32.exe) or a file in the install folder.
+        if ($file -notmatch '\\' -and $file -notmatch '(?i)msiexec' -and $primary.InstallLocation -and -not (Get-Command -Name $file -CommandType Application -ErrorAction SilentlyContinue))
+        {
+            $file = Join-Path $primary.InstallLocation $file
+        }
+        Write-ProbeLog "Uninstall: `"$file`" $uArgs  (from $(if ($fromQuiet) { 'QuietUninstallString' } else { 'UninstallString' }))"
+        $un = Invoke-Monitored -FilePath $file -Arguments $uArgs -TimeoutSec $Cfg.TimeoutSec -UiGraceSec $Cfg.UiGraceSec -IdleSec $Cfg.IdleSec
+        Start-Sleep -Seconds 3
+        $final = Get-UninstallSnapshot
+        $gone  = -not $final.ContainsKey($primary.Id)
+        $detAfter = $null
+        if ($detPath) { $detAfter = Invoke-Detection $detPath }
+        $result.Uninstall = [ordered]@{
+            File = $file; Arguments = $uArgs; FromQuietUninstallString = $fromQuiet
+            ExitCode = $un.ExitCode; DurationSec = $un.DurationSec; Stuck = $un.Stuck; TimedOut = $un.TimedOut
+            WindowTitles = @($un.WindowTitles); EntryRemoved = $gone; DetectionAfter = $detAfter
+            Verified = ($gone -and -not $un.Stuck -and -not $un.TimedOut -and -not ($detAfter -and $detAfter.Detected))
+        }
+        Write-ProbeLog "Uninstall finished: exit $($un.ExitCode), $($un.DurationSec)s, entry removed: $gone$(if ($un.Stuck) { ", STUCK: $($un.Stuck)" })$(if ($detAfter) { ", detected afterwards: $($detAfter.Detected)" })"
     }
+}
+
+function Invoke-ValidateMode($Cfg)
+{
+    Copy-Input $Cfg
+    $pkgDir = Join-Path $workDir 'Package'
+    $exe    = Join-Path $pkgDir 'Invoke-AppDeployToolkit.exe'
+    $detect = Join-Path $workDir $Cfg.DetectScriptName
+    if (-not (Test-Path -LiteralPath $exe)) { throw "Invoke-AppDeployToolkit.exe not found in $pkgDir" }
+    $beforeEntries = Get-UninstallSnapshot
+    $beforeFp      = Get-FootprintSnapshot
+    $v = [ordered]@{ Install = $null; DetectAfterInstall = $null; InstalledFootprint = $null; Uninstall = $null; DetectAfterUninstall = $null; Leftovers = $null; Passed = $false }
+
+    Write-ProbeLog "Package install: Invoke-AppDeployToolkit.exe -DeploymentType Install -DeployMode $($Cfg.DeployMode)"
+    $i = Invoke-Monitored -FilePath $exe -Arguments "-DeploymentType Install -DeployMode $($Cfg.DeployMode)" -WorkingDirectory $pkgDir -TimeoutSec $Cfg.TimeoutSec -UiGraceSec $Cfg.UiGraceSec -IdleSec $Cfg.IdleSec
+    $v.Install = $i
+    Write-ProbeLog "Install finished: exit $($i.ExitCode), $($i.DurationSec)s$(if ($i.Stuck) { ", STUCK: $($i.Stuck)" })$(if ($i.TimedOut) { ', TIMED OUT' })"
+    Start-Sleep -Seconds 3
+    $v.DetectAfterInstall = Invoke-Detection $detect
+    Write-ProbeLog "Detection after install: exit $($v.DetectAfterInstall.ExitCode) $($v.DetectAfterInstall.Output)"
+    $afterEntries = Get-UninstallSnapshot
+    $v.InstalledFootprint = Compare-Footprint $beforeFp (Get-FootprintSnapshot)
+    $v.InstalledEntries = @($afterEntries.Keys | Where-Object { -not $beforeEntries.ContainsKey($_) } | ForEach-Object { $afterEntries[$_] } | Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 } | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)".Trim() })
+
+    Write-ProbeLog "Package uninstall: Invoke-AppDeployToolkit.exe -DeploymentType Uninstall -DeployMode $($Cfg.DeployMode)"
+    $u = Invoke-Monitored -FilePath $exe -Arguments "-DeploymentType Uninstall -DeployMode $($Cfg.DeployMode)" -WorkingDirectory $pkgDir -TimeoutSec $Cfg.TimeoutSec -UiGraceSec $Cfg.UiGraceSec -IdleSec $Cfg.IdleSec
+    $v.Uninstall = $u
+    Write-ProbeLog "Uninstall finished: exit $($u.ExitCode), $($u.DurationSec)s$(if ($u.Stuck) { ", STUCK: $($u.Stuck)" })$(if ($u.TimedOut) { ', TIMED OUT' })"
+    Start-Sleep -Seconds 3
+    $v.DetectAfterUninstall = Invoke-Detection $detect
+    Write-ProbeLog "Detection after uninstall: exit $($v.DetectAfterUninstall.ExitCode) $($v.DetectAfterUninstall.Output)"
+
+    $finalEntries = Get-UninstallSnapshot
+    $left = Compare-Footprint $beforeFp (Get-FootprintSnapshot)
+    $left.Entries = @($finalEntries.Keys | Where-Object { -not $beforeEntries.ContainsKey($_) } | ForEach-Object { $finalEntries[$_] } | Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 } | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)".Trim() })
+    $v.Leftovers = $left
+
+    $codes = @($Cfg.SuccessCodes)
+    $installOk   = -not $i.Stuck -and -not $i.TimedOut -and $null -ne $i.ExitCode -and ($codes -contains [int]$i.ExitCode)
+    $uninstallOk = -not $u.Stuck -and -not $u.TimedOut -and $null -ne $u.ExitCode -and ($codes -contains [int]$u.ExitCode)
+    $v.InstallOk   = $installOk
+    $v.UninstallOk = $uninstallOk
+    $v.Passed = $installOk -and $v.DetectAfterInstall.Detected -and $uninstallOk -and -not $v.DetectAfterUninstall.Detected
+    Write-ProbeLog "Validation: install OK $installOk, detected $($v.DetectAfterInstall.Detected), uninstall OK $uninstallOk, detected after uninstall $($v.DetectAfterUninstall.Detected) => passed: $($v.Passed)"
+    $result.Validation = $v
+
+    $logs = Join-Path $probeDir 'logs'
+    New-Item -ItemType Directory -Path $logs -Force | Out-Null
+    Copy-Item -Path (Join-Path $env:SystemRoot 'Logs\Software\*') -Destination $logs -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+try
+{
+    $cfg = Get-Content -LiteralPath (Join-Path $probeDir 'config.json') -Raw | ConvertFrom-Json
+    $result.Mode  = "$($cfg.Mode)"
+    $result.Label = "$($cfg.Label)"
+    Write-ProbeLog "Probe started as $(whoami) - mode $($cfg.Mode)$(if ($cfg.Label) { ": $($cfg.Label)" })"
+    if ($cfg.Mode -eq 'Validate') { Invoke-ValidateMode $cfg } else { Invoke-InstallMode $cfg }
 }
 catch
 {
     $result.Error = $_.Exception.Message
-    Write-ProbeLog "ERROR: $($_.Exception.Message)"
+    Write-ProbeLog "ERROR: $($_.Exception.Message) $($_.InvocationInfo.PositionMessage)"
 }
 finally
 {
     $result.Finished = (Get-Date).ToString('s')
-    $json = $result | ConvertTo-Json -Depth 8
+    $json = $result | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText($resultPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Write-ProbeLog 'Result written; shutting the sandbox down.'
-    Start-Sleep -Seconds 3
-    Stop-Computer -Force
+    Write-ProbeLog 'Result written.'
 }
-
 '@
 
-function Test-WindowsSandbox
+function Get-WsbPath
 {
-    # Returns the path to WindowsSandbox.exe, or $null with a reason in the log.
-    $exe = Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe'
-    if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
-    Write-PackagerLog 'Windows Sandbox is not installed. Enable it with: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM (Pro/Enterprise/Education, virtualisation enabled).' -Level Warn
+    # The Windows Sandbox CLI ships with the Store-serviced Windows Sandbox (Windows 11 24H2 and later) as an app
+    # execution alias, which is not always on PATH for the process that starts us.
+    $cmd = Get-Command -Name 'wsb.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wsb.exe'
+    if (Test-Path -LiteralPath $alias) { return $alias }
     return $null
 }
 
-function New-SandboxConfigXml
+function Test-WindowsSandbox
 {
-    param([string]$InstallerDir, [string]$RunDir, [bool]$Network)
+    # Returns the path to wsb.exe, or $null with the reason in the log.
+    $wsb = Get-WsbPath
+    if ($wsb) { return $wsb }
+    if (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe'))
+    {
+        Write-PackagerLog 'Windows Sandbox is installed but its command-line interface (wsb.exe) was not found. Update Windows Sandbox from the Microsoft Store, or use Windows 11 24H2 or later.' -Level Warn
+    }
+    else
+    {
+        Write-PackagerLog 'Windows Sandbox is not installed. Enable it in Windows Features (or Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM from Windows PowerShell 5.1 as admin) and reboot.' -Level Warn
+    }
+    return $null
+}
+
+function ConvertTo-CommandLineArgument
+{
+    # Quotes one argument the way CommandLineToArgvW / .NET expect (wsb.exe is a .NET app).
+    param([string]$Text)
+    if ($null -eq $Text) { $Text = '' }
+    if ($Text -and $Text -notmatch '[\s"]') { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $slashes = 0
+    foreach ($ch in $Text.ToCharArray())
+    {
+        if ($ch -eq '\') { $slashes++; continue }
+        if ($ch -eq '"') { [void]$sb.Append('\' * ($slashes * 2 + 1)); [void]$sb.Append('"') }
+        else { if ($slashes) { [void]$sb.Append('\' * $slashes) }; [void]$sb.Append($ch) }
+        $slashes = 0
+    }
+    if ($slashes) { [void]$sb.Append('\' * ($slashes * 2)) }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Invoke-Wsb
+{
+    # Runs wsb.exe and returns its exit code and output. Keeps the GUI responsive and calls OnTick while waiting.
+    param([Parameter(Mandatory)][string[]]$Arguments, [int]$TimeoutSec = 120, [scriptblock]$OnTick)
+    $wsb = Get-WsbPath
+    if (-not $wsb) { throw 'wsb.exe (Windows Sandbox CLI) was not found.' }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName  = $wsb
+    $psi.Arguments = (@($Arguments | ForEach-Object { ConvertTo-CommandLineArgument $_ })) -join ' '
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $timedOut = $false
+    while (-not $p.WaitForExit(500))
+    {
+        Invoke-UiRefresh
+        if ($OnTick) { & $OnTick }
+        if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; try { $p.Kill() } catch { }; break }
+    }
+    [void]$p.WaitForExit(5000)
+    $text = ("$($outTask.Result)`n$($errTask.Result)").Trim()
+    $code = $null
+    if (-not $timedOut) { $code = $p.ExitCode }
+    return [pscustomobject]@{ ExitCode = $code; Output = $text; TimedOut = $timedOut }
+}
+
+function Get-RunningSandboxIds
+{
+    $r = Invoke-Wsb -Arguments @('list') -TimeoutSec 30
+    return @([regex]::Matches("$($r.Output)", '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') | ForEach-Object { $_.Value })
+}
+
+function Start-PackagerSandbox
+{
+    # Starts a headless sandbox (no window) with the given folders mapped; returns its id.
+    param([Parameter(Mandatory)][object[]]$MappedFolders, [bool]$Network = $true)
+    $ours = Join-Path $script:AppDataDir 'Sandbox\running.txt'
+    $running = @(Get-RunningSandboxIds)
+    if ($running.Count -gt 0)
+    {
+        # running.txt lists the sandboxes the packager started as "id|owner process id". One whose owner has exited
+        # (packager closed mid-run) is left over and can go; one whose owner is still running belongs to another
+        # packager window; anything not listed belongs to the user.
+        $known = @{}
+        if (Test-Path -LiteralPath $ours)
+        {
+            foreach ($line in @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ }))
+            {
+                $parts = $line.Split('|')
+                $owner = 0
+                if ($parts.Count -gt 1) { [void][int]::TryParse($parts[1], [ref]$owner) }
+                $known[$parts[0]] = $owner
+            }
+        }
+        foreach ($id in $running)
+        {
+            if (-not $known.ContainsKey($id)) { throw 'A Windows Sandbox is already running. Only one can run at a time - close it and try again.' }
+            $owner = $known[$id]
+            if ($owner -and $owner -ne $PID -and (Get-Process -Id $owner -ErrorAction SilentlyContinue))
+            {
+                throw 'Another PSADT Packager window is using Windows Sandbox right now, and only one sandbox can run at a time. Wait for it to finish and try again.'
+            }
+            Write-PackagerLog "Stopping a sandbox left over from an earlier run ($id)"
+            [void](Invoke-Wsb -Arguments @('stop', '--id', $id) -TimeoutSec 60)
+        }
+    }
     $esc = { param($t) [System.Security.SecurityElement]::Escape("$t") }
-    return @"
-<Configuration>
-  <MappedFolders>
-    <MappedFolder>
-      <HostFolder>$(& $esc $InstallerDir)</HostFolder>
-      <SandboxFolder>C:\Installer</SandboxFolder>
-      <ReadOnly>true</ReadOnly>
-    </MappedFolder>
-    <MappedFolder>
-      <HostFolder>$(& $esc $RunDir)</HostFolder>
-      <SandboxFolder>C:\Probe</SandboxFolder>
-      <ReadOnly>false</ReadOnly>
-    </MappedFolder>
-  </MappedFolders>
-  <LogonCommand>
-    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Probe\Run-Probe.ps1</Command>
-  </LogonCommand>
-  <Networking>$(if ($Network) { 'Default' } else { 'Disable' })</Networking>
-</Configuration>
-"@
+    $xml = '<Configuration><MappedFolders>'
+    foreach ($m in $MappedFolders)
+    {
+        $xml += '<MappedFolder><HostFolder>' + (& $esc $m.Host) + '</HostFolder><SandboxFolder>' + (& $esc $m.Sandbox) + '</SandboxFolder><ReadOnly>' + $(if ($m.ReadOnly) { 'true' } else { 'false' }) + '</ReadOnly></MappedFolder>'
+    }
+    $xml += '</MappedFolders><Networking>' + $(if ($Network) { 'Default' } else { 'Disable' }) + '</Networking></Configuration>'
+    $r = Invoke-Wsb -Arguments @('start', '--config', $xml, '--raw') -TimeoutSec 180
+    $id = $null
+    try { $id = "$(($r.Output | ConvertFrom-Json).Id)" } catch { }
+    if (-not $id) { $id = ([regex]::Match("$($r.Output)", '[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}')).Value }
+    if (-not $id) { throw "Windows Sandbox did not start: $($r.Output)" }
+    $dir = Split-Path -Path $ours -Parent
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Add-Content -LiteralPath $ours -Value "$id|$PID"
+    return $id
+}
+
+function Stop-PackagerSandbox
+{
+    param([string]$Id)
+    if (-not $Id) { return }
+    [void](Invoke-Wsb -Arguments @('stop', '--id', $Id) -TimeoutSec 90)
+    $ours = Join-Path $script:AppDataDir 'Sandbox\running.txt'
+    if (Test-Path -LiteralPath $ours)
+    {
+        $keep = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Split('|')[0] -ne $Id })
+        Set-Content -LiteralPath $ours -Value $keep
+    }
+}
+
+function Invoke-SandboxRun
+{
+    # One sandbox, one Run-Probe.ps1 execution as SYSTEM. Streams probe.log into the packager log; returns result.json.
+    param
+    (
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$RunDir,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [int]$TimeoutSec = 1800,
+        [bool]$Network = $true
+    )
+    if (-not (Test-Path -LiteralPath $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
+    Write-Utf8File -Path (Join-Path $RunDir 'Run-Probe.ps1') -Content $script:SandboxProbeScript
+    Write-Utf8File -Path (Join-Path $RunDir 'config.json') -Content ($Config | ConvertTo-Json -Depth 6)
+    $logPath    = Join-Path $RunDir 'probe.log'
+    $resultPath = Join-Path $RunDir 'result.json'
+    foreach ($f in @($logPath, $resultPath)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+
+    $id = Start-PackagerSandbox -Network $Network -MappedFolders @(
+        @{ Host = $SourceRoot; Sandbox = 'C:\Source'; ReadOnly = $true },
+        @{ Host = $RunDir;     Sandbox = 'C:\Probe';  ReadOnly = $false }
+    )
+    try
+    {
+        $script:ProbeLogLines = 0
+        $tail = {
+            if (Test-Path -LiteralPath $logPath)
+            {
+                $lines = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue)
+                for ($n = $script:ProbeLogLines; $n -lt $lines.Count; $n++) { Write-PackagerLog "  sandbox> $($lines[$n])" }
+                $script:ProbeLogLines = $lines.Count
+            }
+        }
+        $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Probe\Run-Probe.ps1'
+        $r = Invoke-Wsb -Arguments @('exec', '--id', $id, '-c', $cmd, '-r', 'System', '--raw') -TimeoutSec $TimeoutSec -OnTick $tail
+        & $tail
+        if ($r.TimedOut) { Write-PackagerLog "The sandbox run did not finish within $([int]($TimeoutSec / 60)) minutes; stopping it." -Level Warn }
+        elseif ($r.ExitCode -ne 0) { Write-PackagerLog "wsb exec reported: $($r.Output)" -Level Warn }
+    }
+    finally
+    {
+        Stop-PackagerSandbox -Id $id
+    }
+    if (-not (Test-Path -LiteralPath $resultPath)) { return $null }
+    return ([System.IO.File]::ReadAllText($resultPath) | ConvertFrom-Json)
+}
+
+function New-ProbeLaunch
+{
+    # Turns "run this file with these arguments" into the command line used inside the sandbox (C:\Work is the copy).
+    param([Parameter(Mandatory)][string]$RelativePath, [string]$Arguments)
+    $sandboxFile = Join-Path 'C:\Work' $RelativePath
+    $dir = Split-Path -Path $sandboxFile -Parent
+    switch ([System.IO.Path]::GetExtension($RelativePath).ToLowerInvariant())
+    {
+        '.ps1'  { return @{ FilePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; Arguments = ("-NoProfile -ExecutionPolicy Bypass -File `"$sandboxFile`" $Arguments").Trim(); WorkingDirectory = $dir } }
+        { $_ -in @('.cmd', '.bat') } { return @{ FilePath = 'C:\Windows\System32\cmd.exe'; Arguments = ('/c ""' + $sandboxFile + '" ' + $Arguments + '"'); WorkingDirectory = $dir } }
+        '.vbs'  { return @{ FilePath = 'C:\Windows\System32\cscript.exe'; Arguments = ("//nologo //B `"$sandboxFile`" $Arguments").Trim(); WorkingDirectory = $dir } }
+        '.msi'  { return @{ FilePath = 'C:\Windows\System32\msiexec.exe'; Arguments = ("/i `"$sandboxFile`" /qn /norestart $Arguments").Trim(); WorkingDirectory = $dir } }
+        default { return @{ FilePath = $sandboxFile; Arguments = "$Arguments"; WorkingDirectory = $dir } }
+    }
 }
 
 function Invoke-SandboxProbe
 {
-    # Boots one sandbox per candidate, stops at the first one that installs silently. Returns every result collected.
+    # Tries each candidate in a fresh sandbox (as SYSTEM) and stops at the first that installs silently. Returns every
+    # result collected. Candidates are argument strings for the installer.
     param
     (
         [Parameter(Mandatory)][string]$InstallerPath,
-        [Parameter(Mandatory)][string[]]$Candidates,
+        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Candidates,
+        [string]$SourceRoot,                 # folder holding everything the installer needs; default = the installer's folder
+        [switch]$CopyWholeSource,            # copy all of SourceRoot into the sandbox, not just the installer
         [string]$DetectionScript,
         [string]$UninstallArgs,
+        [string]$AppNameHint,
         [int[]]$SuccessCodes = @(0, 3010, 1641),
-        [int]$TimeoutMinutes = 10,
-        [int]$UiGraceSeconds = 20,
+        [int]$TimeoutMinutes = 30,          # backstop only; hangs are caught by the idle rules (each MSI in a sandbox costs ~2 min)
+        [int]$UiGraceSeconds = 30,
+        [int]$IdleSeconds = 300,             # a windowless pause this long counts as hung (first MSI in a fresh sandbox can stall ~2 min on trust checks)
         [string]$HelpSwitch = '/?',
-        [bool]$Network = $true
+        [bool]$Network = $true,
+        [scriptblock]$OnAttempt              # called as (attempt number, total, candidate) before each sandbox run
     )
-    $sandboxExe = Test-WindowsSandbox
-    if (-not $sandboxExe) { throw 'Windows Sandbox is not available on this PC.' }
+    if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox (with its wsb command-line tool) is not available on this PC.' }
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw "Installer not found: $InstallerPath" }
-    if (Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue) { throw 'A Windows Sandbox is already open. Close it first - only one can run at a time.' }
+    $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
+    if (-not $SourceRoot) { $SourceRoot = Split-Path -Path $InstallerPath -Parent }
+    $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\')
+    if (-not $InstallerPath.StartsWith($SourceRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "The installer is not inside $SourceRoot" }
+    $rel = $InstallerPath.Substring($SourceRoot.Length + 1)
 
     $runRoot = Join-Path $script:AppDataDir ('Sandbox\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
-    Write-Utf8File -Path (Join-Path $runRoot 'Run-Probe.ps1') -Content $script:SandboxProbeScript
-    $wsbPath = Join-Path $runRoot 'probe.wsb'
-    Write-Utf8File -Path $wsbPath -Content (New-SandboxConfigXml -InstallerDir (Split-Path -Path $InstallerPath -Parent) -RunDir $runRoot -Network $Network)
-    Write-PackagerLog "Sandbox run folder: $runRoot"
-
+    Write-PackagerLog "Sandbox runs: $runRoot"
     $results = New-Object System.Collections.Generic.List[object]
     $n = 0
     foreach ($candidate in $Candidates)
     {
         $n++
-        $resultPath = Join-Path $runRoot 'result.json'
-        $logPath    = Join-Path $runRoot 'probe.log'
-        foreach ($f in @($resultPath, $logPath)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+        $launch = New-ProbeLaunch -RelativePath $rel -Arguments $candidate
+        $help = $null
+        if ($n -eq 1 -and $HelpSwitch -and [System.IO.Path]::GetExtension($rel) -ieq '.exe') { $help = New-ProbeLaunch -RelativePath $rel -Arguments $HelpSwitch }
         $config = [ordered]@{
-            InstallerName        = Split-Path -Path $InstallerPath -Leaf
-            Candidate            = $candidate
-            HelpSwitch           = $(if ($n -eq 1) { $HelpSwitch } else { '' })
-            TimeoutSec           = $TimeoutMinutes * 60
-            UiGraceSec           = $UiGraceSeconds
-            SuccessCodes         = @($SuccessCodes)
-            UninstallArgs        = "$UninstallArgs"
-            DetectionScriptBase64= $(if ($DetectionScript) { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($DetectionScript)) } else { '' })
+            Mode                  = 'Install'
+            Label                 = $candidate
+            CopyItems             = $(if ($CopyWholeSource) { @() } else { @($rel) })
+            FilePath              = $launch.FilePath
+            Arguments             = $launch.Arguments
+            WorkingDirectory      = $launch.WorkingDirectory
+            Help                  = $help
+            TimeoutSec            = $TimeoutMinutes * 60
+            UiGraceSec            = $UiGraceSeconds
+            IdleSec               = $IdleSeconds
+            SuccessCodes          = @($SuccessCodes)
+            UninstallArgs         = "$UninstallArgs"
+            AppNameHint           = "$AppNameHint"
+            DetectionScriptBase64 = $(if ($DetectionScript) { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($DetectionScript)) } else { '' })
         }
-        Write-Utf8File -Path (Join-Path $runRoot 'config.json') -Content ($config | ConvertTo-Json -Depth 5)
-
-        Write-PackagerLog "Sandbox $n of $($Candidates.Count): trying [$candidate]"
-        $proc = Start-Process -FilePath $sandboxExe -ArgumentList "`"$wsbPath`"" -PassThru
-        $deadline = (Get-Date).AddSeconds($TimeoutMinutes * 60 * 2 + 300)   # help probe + install + uninstall + boot
-        $logLines = 0
-        $got = $false
-        while ((Get-Date) -lt $deadline)
+        Write-PackagerLog "Sandbox $n of $($Candidates.Count): $rel $candidate"
+        if ($OnAttempt) { & $OnAttempt $n $Candidates.Count $candidate }
+        $r = Invoke-SandboxRun -SourceRoot $SourceRoot -RunDir (Join-Path $runRoot "attempt-$n") -Config $config -TimeoutSec ($TimeoutMinutes * 60 * 2 + 300) -Network $Network
+        if (-not $r)
         {
-            Start-Sleep -Seconds 2
-            if (Test-Path -LiteralPath $logPath)
-            {
-                $lines = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue)
-                for ($i = $logLines; $i -lt $lines.Count; $i++) { Write-PackagerLog "  sandbox> $($lines[$i])" }
-                $logLines = $lines.Count
-            }
-            else { Invoke-UiRefresh }
-            if (Test-Path -LiteralPath $resultPath) { Start-Sleep -Seconds 2; $got = $true; break }
-            $proc.Refresh()
-            if ($proc.HasExited -and -not (Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue)) { break }
-        }
-
-        # Let the sandbox finish shutting down before starting the next one.
-        $wait = (Get-Date).AddSeconds(90)
-        while ((Get-Date) -lt $wait -and (Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue)) { Start-Sleep -Seconds 2; Invoke-UiRefresh }
-        Get-Process -Name WindowsSandbox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
-        if (-not $got)
-        {
-            Write-PackagerLog "No result came back for [$candidate] (sandbox closed or timed out)." -Level Warn
-            $results.Add([pscustomobject]@{ Candidate = $candidate; InstallSucceeded = $false; Error = 'No result from sandbox'; Install = $null; NewEntries = @(); Uninstall = $null; Help = $null; Detection = $null })
+            Write-PackagerLog "No result came back for [$candidate]." -Level Warn
+            $results.Add([pscustomobject]@{ Candidate = $candidate; InstallSucceeded = $false; Error = 'No result from the sandbox'; Install = $null; NewEntries = @(); PrimaryEntry = $null; Footprint = $null; Uninstall = $null; Help = $null; Detection = $null; RunDir = (Join-Path $runRoot "attempt-$n") })
             continue
         }
-        $r = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-        Copy-Item -LiteralPath $resultPath -Destination (Join-Path $runRoot "result-$n.json") -Force
+        $r | Add-Member -NotePropertyName Candidate -NotePropertyValue $candidate -Force
+        $r | Add-Member -NotePropertyName RunDir -NotePropertyValue (Join-Path $runRoot "attempt-$n") -Force
         $results.Add($r)
         if ($r.Error) { Write-PackagerLog "Sandbox reported: $($r.Error)" -Level Warn }
         if ($r.InstallSucceeded)
@@ -1962,15 +2774,64 @@ function Invoke-SandboxProbe
             Write-PackagerLog "[$candidate] installed silently (exit $($r.Install.ExitCode), $($r.Install.DurationSec)s)."
             break
         }
-        $why = if ($r.Install.UiPersisted) { "showed a window: $(@($r.Install.WindowTitles) -join ' | ')" }
-               elseif ($r.Install.TimedOut) { 'timed out' }
-               elseif ($r.Install.StartFailed) { 'did not start' }
-               elseif ($null -eq $r.Install.ExitCode) { 'no exit code' }
-               elseif (@($SuccessCodes) -notcontains [int]$r.Install.ExitCode) { "exit code $($r.Install.ExitCode)" }
-               else { 'exited cleanly but nothing was installed' }
-        Write-PackagerLog "[$candidate] failed: $why" -Level Warn
+        Write-PackagerLog "[$candidate] failed: $(Get-ProbeFailureReason -Result $r -SuccessCodes $SuccessCodes)" -Level Warn
     }
     return $results.ToArray()
+}
+
+function Get-ProbeFailureReason
+{
+    param($Result, [int[]]$SuccessCodes = @(0, 3010, 1641))
+    $i = $Result.Install
+    if ($Result.Error -and -not $i)              { return "$($Result.Error)" }
+    if (-not $i)                                 { return 'no result' }
+    if ($i.StartFailed)                          { return "did not start ($($i.StdErr))" }
+    if ($i.Stuck)                                { return "$($i.Stuck)" }
+    if ($i.TimedOut)                             { return 'timed out' }
+    if ($null -eq $i.ExitCode)                   { return 'no exit code' }
+    if (@($SuccessCodes) -notcontains [int]$i.ExitCode) { return "exit code $($i.ExitCode)" }
+    return 'exited cleanly but nothing was installed'
+}
+
+function Invoke-SandboxValidation
+{
+    # Runs the built package in a fresh sandbox exactly as Intune would (SYSTEM, silent): install, detect, uninstall,
+    # detect again. Copies the toolkit logs next to the package.
+    param
+    (
+        [Parameter(Mandatory)][string]$PackageRoot,
+        [Parameter(Mandatory)][string]$DetectName,
+        [int[]]$SuccessCodes = @(0, 3010, 1641),
+        [string]$DeployMode = 'Silent',
+        [int]$TimeoutMinutes = 45,
+        [bool]$Network = $true
+    )
+    if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox (with its wsb command-line tool) is not available on this PC.' }
+    $runDir = Join-Path $script:AppDataDir ('Sandbox\' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-validate')
+    $config = [ordered]@{
+        Mode             = 'Validate'
+        Label            = 'End-to-end package test'
+        CopyItems        = @('Package', $DetectName)
+        DetectScriptName = $DetectName
+        DeployMode       = $DeployMode
+        TimeoutSec       = $TimeoutMinutes * 60
+        UiGraceSec       = 60
+        IdleSec          = 300
+        SuccessCodes     = @($SuccessCodes)
+    }
+    Write-PackagerLog 'Validating the package in a fresh sandbox (install, detect, uninstall, detect) as SYSTEM'
+    $r = Invoke-SandboxRun -SourceRoot $PackageRoot -RunDir $runDir -Config $config -TimeoutSec ($TimeoutMinutes * 60 * 2 + 300) -Network $Network
+    if ($r) { $r | Add-Member -NotePropertyName RunDir -NotePropertyValue $runDir -Force }
+    $logs = Join-Path $runDir 'logs'
+    if (Test-Path -LiteralPath $logs)
+    {
+        $dest = Join-Path $PackageRoot 'Validation'
+        if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        Copy-Item -Path (Join-Path $logs '*') -Destination $dest -Recurse -Force
+        foreach ($f in @('probe.log', 'result.json')) { $src = Join-Path $runDir $f; if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $dest -Force } }
+    }
+    return $r
 }
 
 function Get-ProbeSummary
@@ -1982,23 +2843,21 @@ function Get-ProbeSummary
     if ($win)
     {
         $L.Add("Silent install works with:  $($win.Candidate)")
-        foreach ($e in @($win.NewEntries)) { $L.Add("Registered as: $($e.DisplayName) $($e.DisplayVersion)  (publisher: $($e.Publisher), $($e.Location))") }
-        if ($win.Detection) { $L.Add("Detection script: $(if ($win.Detection.ExitCode -eq 0) { 'DETECTED' } else { 'not detected' })") }
+        $e = $win.PrimaryEntry
+        if ($e) { $L.Add("Registered as: $($e.DisplayName) $($e.DisplayVersion)  (publisher: $($e.Publisher), $($e.Location))") }
+        foreach ($f in @($win.Footprint.Folders)) { $L.Add("Created folder: $($f.Path)") }
+        if (@($win.Footprint.PerUser).Count -gt 0) { $L.Add("WARNING: installed into the SYSTEM profile (a per-user installer): $(@($win.Footprint.PerUser) -join ', ')") }
+        if ($win.Detection) { $L.Add("Detection script: $(if ($win.Detection.Detected) { 'DETECTED' } else { 'not detected' })") }
         if ($win.Uninstall)
         {
             $L.Add("Uninstall $(if ($win.Uninstall.Verified) { 'verified' } else { 'attempted, NOT verified' }): `"$($win.Uninstall.File)`" $($win.Uninstall.Arguments)")
         }
-        elseif (@($win.NewEntries).Count -eq 0) { $L.Add('No Uninstall registry entry appeared; uninstall could not be tested.') }
+        elseif (-not $e) { $L.Add('No uninstall entry appeared; the uninstall could not be tested here.') }
     }
     else
     {
         $L.Add('None of the candidates installed silently:')
-        foreach ($r in @($Results))
-        {
-            $i = $r.Install
-            $why = if ($r.Error) { $r.Error } elseif (-not $i) { 'no result' } elseif ($i.UiPersisted) { "shows UI ($(@($i.WindowTitles) -join ' | '))" } elseif ($i.TimedOut) { 'timed out' } else { "exit $($i.ExitCode), nothing registered" }
-            $L.Add("  [$($r.Candidate)] - $why")
-        }
+        foreach ($r in @($Results)) { $L.Add("  [$($r.Candidate)] - $(Get-ProbeFailureReason -Result $r)") }
     }
     $help = @($Results | Where-Object { $_.Help -and "$($_.Help.Text)".Trim() }) | Select-Object -First 1
     if ($help)
@@ -2009,44 +2868,866 @@ function Get-ProbeSummary
     return ($L -join "`n")
 }
 
+#endregion
+
+#region ---------------------------------------------------------------- Auto-package: drop anything, get a tested package
+
+# Script names that say nothing about the app; the folder (or zip) name is used instead.
+$script:GenericScriptNames = '^(install|setup|deploy|run|main|start|silent|default|go)([-_ ]?(app|all|script|me|silent|x64|x86))?$'
+
+function Get-EntryKind
+{
+    param([string]$Path)
+    switch ([System.IO.Path]::GetExtension($Path).ToLowerInvariant())
+    {
+        '.msi'  { return 'MSI' }
+        '.exe'  { return 'EXE' }
+        { $_ -in @('.msix', '.appx', '.msixbundle', '.appxbundle') } { return 'MSIX' }
+        { $_ -in @('.ps1', '.cmd', '.bat', '.vbs') } { return 'Script' }
+    }
+    return $null
+}
+
+function Get-RelativePath
+{
+    param([string]$Root, [string]$Path)
+    $r = $Root.TrimEnd('\') + '\'
+    if ($Path.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { return $Path.Substring($r.Length) }
+    return [System.IO.Path]::GetFileName($Path)
+}
+
+function Resolve-PackageInput
+{
+    # Works out what was dropped. A .zip is extracted first; a folder is searched for its entry point; a folder of program
+    # files with no installer is a portable app. Returns where the content lives (Root), whether the whole folder ships
+    # (IsFolder), the entry file, how to treat it (Kind: MSI, EXE, MSIX, Script, Portable) and a name hint.
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Not found: $Path" }
+    $item  = Get-Item -LiteralPath $Path -Force
+    $notes = New-Object System.Collections.Generic.List[string]
+    $forced = $null
+    if (-not $item.PSIsContainer -and $item.Extension -ine '.zip')
+    {
+        $kind = Get-EntryKind -Path $item.FullName
+        if (-not $kind) { throw "Don't know how to package '$($item.Name)'. Drop an .msi, .exe, .msix/.appx, .ps1, .cmd, .bat, .vbs, a .zip or a folder." }
+        # setup.exe / install.cmd almost always need the files next to them (the MSI the script calls, the CABs the
+        # setup reads), so their folder ships too - unless it is a catch-all folder such as Downloads.
+        $generic = $item.BaseName -match '^(setup|install|installer)$' -or ($kind -eq 'Script' -and $item.BaseName -match $script:GenericScriptNames)
+        $catchAll = @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments'), (Join-Path $env:USERPROFILE 'Downloads'), $env:USERPROFILE, $env:TEMP) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+        if (-not $generic -or $catchAll -contains $item.DirectoryName.TrimEnd('\'))
+        {
+            $hint = $item.BaseName
+            $single = @()
+            if ($generic)
+            {
+                $hint = $item.Directory.Name
+                $single = @("Only $($item.Name) was packaged: it sits in $($item.DirectoryName), so its neighbours were not included. Drop its own folder instead if it needs other files.")
+            }
+            return [pscustomobject]@{ Root = $item.DirectoryName; IsFolder = $false; Entry = $item.FullName; EntryRelative = $item.Name; Kind = $kind; NameHint = $hint; Transforms = @(); UninstallScript = ''; Notes = $single }
+        }
+        $forced = $item
+        $notes.Add("$($item.Name) is packaged together with the rest of its folder, $($item.DirectoryName).")
+        $item = Get-Item -LiteralPath $item.DirectoryName -Force
+    }
+
+    if ($item.PSIsContainer)
+    {
+        $folder = $item.FullName.TrimEnd('\')
+        $hint   = $item.Name
+    }
+    else
+    {
+        $stage = Join-Path $script:AppDataDir ('Staging\' + (Get-SafeName $item.BaseName) + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        Write-PackagerLog "Extracting $($item.Name) to $stage"
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($item.FullName, $stage)
+        $folder = $stage
+        $notes.Add("Extracted $($item.Name) to $stage")
+        $hint = $item.BaseName
+    }
+
+    # A wrapper folder with nothing but one subfolder: use the subfolder.
+    $files = @(Get-ChildItem -LiteralPath $folder -File -Force -ErrorAction SilentlyContinue)
+    while ($files.Count -eq 0)
+    {
+        $dirs = @(Get-ChildItem -LiteralPath $folder -Directory -Force -ErrorAction SilentlyContinue)
+        if ($dirs.Count -ne 1) { break }
+        $folder = $dirs[0].FullName
+        $files  = @(Get-ChildItem -LiteralPath $folder -File -Force -ErrorAction SilentlyContinue)
+    }
+
+    $scriptOrder = @('.ps1', '.cmd', '.bat', '.vbs')
+    $isScript = { param($f) $scriptOrder -contains $f.Extension.ToLowerInvariant() }
+    $installScripts = @($files | Where-Object { (& $isScript $_) -and $_.BaseName -match '^(install|setup|deploy|silent[-_ ]?install)' } | Sort-Object { $scriptOrder.IndexOf($_.Extension.ToLowerInvariant()) })
+    $uninstallScripts = @($files | Where-Object { (& $isScript $_) -and $_.BaseName -match '^(uninstall|remove)' } | Sort-Object { $scriptOrder.IndexOf($_.Extension.ToLowerInvariant()) })
+    $msis  = @($files | Where-Object { $_.Extension -ieq '.msi' })
+    $exes  = @($files | Where-Object { $_.Extension -ieq '.exe' })
+    $appx  = @($files | Where-Object { $_.Extension -match '^\.(msix|appx|msixbundle|appxbundle)$' })
+    $setup = @($exes | Where-Object { $_.BaseName -match '^(setup|install|installer)$' }) | Select-Object -First 1
+
+    $entry = $null; $kind = $null
+    if ($forced)                               { $entry = $forced; $kind = Get-EntryKind -Path $forced.FullName }
+    elseif ($installScripts.Count -gt 0)       { $entry = $installScripts[0]; $kind = 'Script' }
+    elseif ($msis.Count -eq 1 -and -not $setup) { $entry = $msis[0]; $kind = 'MSI' }
+    elseif ($setup)                            { $entry = $setup; $kind = 'EXE' }
+    elseif ($msis.Count -gt 1)
+    {
+        $entry = $msis | Sort-Object Length -Descending | Select-Object -First 1
+        $kind  = 'MSI'
+        $notes.Add("Several MSIs in the folder; using the largest, $($entry.Name). The others ship alongside it.")
+    }
+    elseif ($appx.Count -gt 0)                 { $entry = $appx[0]; $kind = 'MSIX' }
+    elseif ($exes.Count -gt 0)
+    {
+        $installers = @($exes | Where-Object { (Get-InstallerEngine -Path $_.FullName) -ne 'Unknown' })
+        if ($installers.Count -eq 1) { $entry = $installers[0]; $kind = 'EXE' }
+        elseif ($installers.Count -gt 1)
+        {
+            $named = @($installers | Where-Object { $_.BaseName -match '(?i)setup|install' })
+            $entry = $(if ($named.Count -gt 0) { $named[0] } else { $installers | Sort-Object Length -Descending | Select-Object -First 1 })
+            $kind  = 'EXE'
+            $notes.Add("Several installers in the folder; using $($entry.Name).")
+        }
+    }
+    if (-not $kind)
+    {
+        # No installer: a portable program if there is an EXE anywhere near the top.
+        $allExe = @(Get-ChildItem -LiteralPath $folder -Recurse -Depth 2 -File -Filter '*.exe' -Force -ErrorAction SilentlyContinue)
+        if ($allExe.Count -gt 0)
+        {
+            $infos = @($allExe | ForEach-Object { [pscustomobject]@{ Path = $_.FullName; Size = $_.Length } })
+            $main  = Select-MainExecutable -Exes $infos -NameHint $hint
+            $entry = Get-Item -LiteralPath $main.Path
+            $kind  = 'Portable'
+            $notes.Add("No installer found; treating the folder as a portable app with $(Get-RelativePath -Root $folder -Path $entry.FullName) as the program.")
+        }
+    }
+    if (-not $kind) { throw "No installer, script or program found in $folder." }
+
+    $transforms = @()
+    if ($kind -eq 'MSI') { $transforms = @($files | Where-Object { $_.Extension -ieq '.mst' } | ForEach-Object { $_.Name }) }
+    $uninstallRel = ''
+    if ($uninstallScripts.Count -gt 0) { $uninstallRel = $uninstallScripts[0].Name }
+    if ($kind -eq 'Script' -and $entry.BaseName -notmatch $script:GenericScriptNames -and -not $item.PSIsContainer -and $item.Extension -ine '.zip') { $hint = $entry.BaseName }
+
+    return [pscustomobject]@{
+        Root            = $folder
+        IsFolder        = $true
+        Entry           = $entry.FullName
+        EntryRelative   = Get-RelativePath -Root $folder -Path $entry.FullName
+        Kind            = $kind
+        NameHint        = $hint
+        Transforms      = $transforms
+        UninstallScript = $uninstallRel
+        Notes           = @($notes)
+    }
+}
+
+function Select-MainExecutable
+{
+    # The program a user would launch: a Start menu shortcut target first, then the EXE named like the app, then the
+    # biggest EXE nearest the top - skipping uninstallers, updaters and helpers.
+    param([object[]]$Exes, [string]$NameHint, [string[]]$ShortcutTargets)
+    $skip  = '(?i)^(unins|uninst|uninstall|update|updater|autoupdate|crash|crashpad|crashreporter|helper|elevate|setup|install|installer|vc_?redist|dotnet|notification_helper|squirrel|createdump|bsdtar|7z\.sfx)'
+    $all   = @($Exes | Where-Object { $_ -and $_.Path })
+    $cands = @($all | Where-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Path) -notmatch $skip })
+    if ($cands.Count -eq 0) { $cands = $all }
+    if ($cands.Count -eq 0) { return $null }
+    foreach ($t in @($ShortcutTargets | Where-Object { $_ }))
+    {
+        $hit = @($cands | Where-Object { $_.Path -ieq $t }) | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    $h = ("$NameHint" -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+    if ($h.Length -ge 3)
+    {
+        $hit = @($cands | Where-Object {
+            $b = ([System.IO.Path]::GetFileNameWithoutExtension($_.Path) -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+            $b.Length -ge 3 -and ($h.Contains($b) -or $b.Contains($h))
+        } | Sort-Object { $_.Path.Split('\').Count }) | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    return @($cands | Sort-Object @{ Expression = { $_.Path.Split('\').Count } }, @{ Expression = { [int64]$_.Size }; Descending = $true }) | Select-Object -First 1
+}
+
+function ConvertTo-PortablePath
+{
+    # C:\Program Files\X (as seen in the sandbox) -> $env:ProgramFiles\X, so generated code works on any system drive.
+    param([string]$Path)
+    $map = @(
+        @('C:\Program Files (x86)', '${env:ProgramFiles(x86)}'),
+        @('C:\Program Files', '$env:ProgramFiles'),
+        @('C:\ProgramData', '$env:ProgramData'),
+        @('C:\Users\Public', '$env:PUBLIC'),
+        @('C:\Windows', '$env:SystemRoot')
+    )
+    foreach ($m in $map)
+    {
+        if ($Path -ieq $m[0] -or $Path.StartsWith($m[0] + '\', [StringComparison]::OrdinalIgnoreCase)) { return $m[1] + $Path.Substring($m[0].Length) }
+    }
+    return $Path
+}
+
+function Get-VersionedNamePattern
+{
+    # "Microsoft Visual C++ ... (x64) - 14.44.35211" with version 14.44.35211.0 -> "Microsoft Visual C++ ... (x64) - *",
+    # so detection and uninstall keep matching after an upgrade. $null when the name does not contain the version.
+    param([string]$DisplayName, [string]$Version)
+    if (-not $DisplayName -or -not $Version) { return $null }
+    $v = Get-CleanVersion $Version
+    $tries = New-Object System.Collections.Generic.List[string]
+    $parts = @($v.Split('.'))
+    for ($n = $parts.Count; $n -ge 2; $n--) { $tries.Add(($parts[0..($n - 1)] -join '.')) }
+    foreach ($t in $tries)
+    {
+        $i = $DisplayName.IndexOf($t)
+        if ($i -ge 0)
+        {
+            $after = $DisplayName.Substring($i + $t.Length)
+            if ($after -match '^\d') { continue }
+            return [System.Management.Automation.WildcardPattern]::Escape($DisplayName.Substring(0, $i)) + '*' + [System.Management.Automation.WildcardPattern]::Escape($after)
+        }
+    }
+    return $null
+}
+
+function New-FootprintUninstallCode
+{
+    # Uninstall code for installs that register no uninstaller: undo what the install was seen to create in the sandbox.
+    param([Parameter(Mandatory)]$Footprint)
+    $q = { param($t) ConvertTo-PsExpandableString $t }
+    $L = New-Object System.Collections.Generic.List[string]
+    $L.Add('## Generated by PSADT Packager from what the install created in Windows Sandbox (it registered no uninstaller).')
+    $L.Add('## Review it before relying on it in production.')
+    $services = @($Footprint.Services | ForEach-Object { $_.Name } | Where-Object { $_ })
+    if ($services.Count -gt 0)
+    {
+        $L.Add('foreach ($serviceName in @(' + (($services | ForEach-Object { ConvertTo-PsSingleQuoted $_ }) -join ', ') + '))')
+        $L.Add('{')
+        $L.Add('    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)')
+        $L.Add('    {')
+        $L.Add('        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue')
+        $L.Add('        & "$env:SystemRoot\System32\sc.exe" delete $serviceName | Out-Null')
+        $L.Add('    }')
+        $L.Add('}')
+    }
+    foreach ($t in @($Footprint.Tasks | Where-Object { $_ }))
+    {
+        $i = $t.LastIndexOf('\')
+        $L.Add('Get-ScheduledTask -TaskPath ' + (ConvertTo-PsSingleQuoted $t.Substring(0, $i + 1)) + ' -TaskName ' + (ConvertTo-PsSingleQuoted $t.Substring($i + 1)) + ' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false')
+    }
+    $links = @($Footprint.Shortcuts | ForEach-Object { $_.Path } | Where-Object { $_ })
+    if ($links.Count -gt 0)
+    {
+        $L.Add('foreach ($shortcut in @(' + (($links | ForEach-Object { '"' + (& $q (ConvertTo-PortablePath $_)) + '"' }) -join ', ') + '))')
+        $L.Add('{')
+        $L.Add('    if (Test-Path -LiteralPath $shortcut) { Remove-ADTFile -LiteralPath $shortcut }')
+        $L.Add('}')
+        $programs = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs'
+        $menuDirs = @($links | ForEach-Object { Split-Path -Path $_ -Parent } | Where-Object { $_ -like "$programs\*" } | Select-Object -Unique)
+        if ($menuDirs.Count -gt 0)
+        {
+            $L.Add('foreach ($menuFolder in @(' + (($menuDirs | ForEach-Object { '"' + (& $q (ConvertTo-PortablePath $_)) + '"' }) -join ', ') + '))')
+            $L.Add('{')
+            $L.Add('    if ((Test-Path -LiteralPath $menuFolder) -and -not (Get-ChildItem -LiteralPath $menuFolder -Force)) { Remove-ADTFolder -LiteralPath $menuFolder }')
+            $L.Add('}')
+        }
+    }
+    $folders = @($Footprint.Folders | Where-Object { $_ -and -not $_.PerUser } | ForEach-Object { $_.Path })
+    if ($folders.Count -gt 0)
+    {
+        $L.Add('foreach ($folder in @(' + (($folders | ForEach-Object { '"' + (& $q (ConvertTo-PortablePath $_)) + '"' }) -join ', ') + '))')
+        $L.Add('{')
+        $L.Add('    if (Test-Path -LiteralPath $folder) { Remove-ADTFolder -LiteralPath $folder }')
+        $L.Add('}')
+    }
+    $keys = @($Footprint.RegistryKeys | Where-Object { $_ } | ForEach-Object { 'HKLM:' + $_.Substring(4) })
+    if ($keys.Count -gt 0)
+    {
+        $L.Add('foreach ($key in @(' + (($keys | ForEach-Object { ConvertTo-PsSingleQuoted $_ }) -join ', ') + '))')
+        $L.Add('{')
+        $L.Add('    if (Test-Path -LiteralPath $key) { Remove-ADTRegistryKey -LiteralPath $key -Recurse }')
+        $L.Add('}')
+    }
+    return ($L -join "`r`n")
+}
+
 function Set-DefinitionFromProbe
 {
-    # Applies a successful probe: install args, verified uninstall, exact detection, and anything the app tab was missing.
-    param([Parameter(Mandatory)]$Def, [Parameter(Mandatory)]$Result)
+    # Applies a successful sandbox run: install arguments, uninstall (the proven one where possible), detection, and
+    # anything the Application tab was missing. -Auto lets what the installer registered override guesses made from the file.
+    param([Parameter(Mandatory)]$Def, [Parameter(Mandatory)]$Result, [switch]$Auto, [string]$NameHint)
     if (-not $Result.InstallSucceeded) { return $Def }
-    $Def.Install.Arguments = "$($Result.Candidate)"
-    $entry = @($Result.NewEntries) | Select-Object -First 1
+    if ($Def.Install.Type -eq 'EXE') { $Def.Install.Arguments = "$($Result.Candidate)" }
+
+    $entry = $Result.PrimaryEntry
+    if (-not $entry) { $entry = @($Result.NewEntries | Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 }) | Select-Object -First 1 }
+    $fp = $Result.Footprint
+    $mainExe = $null
+    if ($fp)
+    {
+        $exes = @(foreach ($f in @($fp.Folders)) { if (-not $f.PerUser) { @($f.Exes) } })
+        $hint = "$($Def.App.Name)"; if (-not $hint) { $hint = $NameHint }
+        $mainExe = Select-MainExecutable -Exes $exes -NameHint $hint -ShortcutTargets @($fp.Shortcuts | ForEach-Object { $_.Target })
+    }
+
     if ($entry)
     {
-        if (-not "$($Def.App.Vendor)".Trim() -and $entry.Publisher)       { $Def.App.Vendor  = "$($entry.Publisher)".Trim() }
-        if (-not "$($Def.App.Version)".Trim() -and $entry.DisplayVersion) { $Def.App.Version = Get-CleanVersion "$($entry.DisplayVersion)" }
+        if ($entry.Publisher -and ($Auto -or -not "$($Def.App.Vendor)".Trim()))     { $Def.App.Vendor  = "$($entry.Publisher)".Trim() }
+        if ($entry.DisplayVersion -and ($Auto -or -not "$($Def.App.Version)".Trim())) { $Def.App.Version = Get-CleanVersion "$($entry.DisplayVersion)" }
+        # What the installer registers names the app better than its own version resource (an Omaha stub calls
+        # itself "BraveSoftware Update"; the browser it installs registers as "Brave").
+        if ($Auto -or -not "$($Def.App.Name)".Trim()) { $Def.App.Name = Get-CleanAppName -Name "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)" }
+        if (-not "$($Def.App.Arch)".Trim())
+        {
+            # The program's own PE header first: a 32-bit updater (Omaha) registers a 64-bit browser in the 32-bit view.
+            if ($mainExe -and $mainExe.PSObject.Properties['Machine'] -and "$($mainExe.Machine)") { $Def.App.Arch = "$($mainExe.Machine)" }
+            elseif ($entry.Location -eq 'LocalMachine\Registry32') { $Def.App.Arch = 'x86' }
+            elseif ($entry.Location -eq 'LocalMachine\Registry64') { $Def.App.Arch = 'x64' }
+        }
+        $pattern = Get-VersionedNamePattern -DisplayName "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)"
         $Def.Detection.Type        = 'Registry'
-        $Def.Detection.DisplayName = "$($entry.DisplayName)"
-        $Def.Detection.MatchMode   = 'Exact'
+        $Def.Detection.DisplayName = $(if ($pattern) { $pattern } else { "$($entry.DisplayName)" })
+        $Def.Detection.MatchMode   = $(if ($pattern) { 'Wildcard' } else { 'Exact' })
         $Def.Detection.MinVersion  = Get-CleanVersion "$($entry.DisplayVersion)"
     }
+    elseif ($mainExe)
+    {
+        $Def.Detection.Type             = 'File'
+        $Def.Detection.FilePath         = ConvertTo-PortablePath $mainExe.Path
+        $Def.Detection.MinVersion       = $(if ("$($mainExe.FileVersion)" -match '^\d+(\.\d+)+$' -and "$($mainExe.FileVersion)" -ne '0.0.0.0') { "$($mainExe.FileVersion)" } else { '' })
+        $Def.Detection.CheckFileVersion = [bool]$Def.Detection.MinVersion
+        if (-not "$($Def.App.Version)".Trim() -and $Def.Detection.MinVersion) { $Def.App.Version = $Def.Detection.MinVersion }
+    }
+    elseif ($fp -and @($fp.Services).Count -gt 0)
+    {
+        $svc = @($fp.Services)[0].Name
+        $Def.Detection.Type   = 'Script'
+        $Def.Detection.Script = "# The install creates the '$svc' service.`r`nif (Get-Service -Name " + (ConvertTo-PsSingleQuoted $svc) + " -ErrorAction SilentlyContinue)`r`n{`r`n    Write-Output 'Detected: service $svc'`r`n    exit 0`r`n}`r`nexit 1"
+    }
+    elseif ($fp -and @($fp.Folders | Where-Object { -not $_.PerUser }).Count -gt 0)
+    {
+        $folder = ConvertTo-PortablePath (@($fp.Folders | Where-Object { -not $_.PerUser })[0].Path)
+        $Def.Detection.Type   = 'Script'
+        $Def.Detection.Script = "# The install creates this folder (it has no program file or uninstall entry to check).`r`n`$folder = """ + (ConvertTo-PsExpandableString $folder) + """`r`nif (Test-Path -LiteralPath `$folder -PathType Container)`r`n{`r`n    Write-Output ""Detected: `$folder""`r`n    exit 0`r`n}`r`nexit 1"
+    }
+    elseif ($fp -and @($fp.RegistryKeys).Count -gt 0)
+    {
+        $key = 'HKLM:' + (@($fp.RegistryKeys)[0]).Substring(4)
+        $Def.Detection.Type   = 'Script'
+        $Def.Detection.Script = "# The install creates this registry key.`r`n`$key = " + (ConvertTo-PsSingleQuoted $key) + "`r`nif (Test-Path -LiteralPath `$key)`r`n{`r`n    Write-Output ""Detected: `$key""`r`n    exit 0`r`n}`r`nexit 1"
+    }
+    elseif ($fp -and @($fp.Shortcuts).Count -gt 0)
+    {
+        $Def.Detection.Type             = 'File'
+        $Def.Detection.FilePath         = ConvertTo-PortablePath (@($fp.Shortcuts)[0].Path)
+        $Def.Detection.MinVersion       = ''
+        $Def.Detection.CheckFileVersion = $false
+    }
+
     $u = $Result.Uninstall
-    if ($u -and $u.Verified)
+    if ($Def.Uninstall.Type -eq 'Script' -and "$($Def.Uninstall.File)".Trim())
+    {
+        # An uninstall script shipped with the app is the author's intent; keep it.
+    }
+    elseif ($u -and $u.Verified)
     {
         if ("$($u.File)" -match '(?i)msiexec' -and "$($u.Arguments)" -match '\{[0-9A-Fa-f\-]{36}\}')
         {
             $Def.Uninstall.Type        = 'MSI'
             $Def.Uninstall.ProductCode = $Matches[0]
+            $Def.Uninstall.Arguments   = ''
+        }
+        elseif ($entry)
+        {
+            # By name, with exactly the arguments proven in the sandbox: the package looks up the registered
+            # command at uninstall time (quiet one first, as the probe did), so it keeps working after the app has
+            # updated itself and moved its uninstaller (Chromium browsers keep it in a version-numbered folder).
+            $pattern = Get-VersionedNamePattern -DisplayName "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)"
+            $Def.Uninstall.Type            = 'Name'
+            $Def.Uninstall.Name            = $(if ($pattern) { $pattern } else { "$($entry.DisplayName)" })
+            $Def.Uninstall.NameIsRegex     = $false
+            $Def.Uninstall.ApplicationType = 'EXE'
+            $Def.Uninstall.Arguments       = "$($u.Arguments)"
         }
         else
         {
             $Def.Uninstall.Type      = 'EXE'
-            $Def.Uninstall.File      = "$($u.File)"
+            $Def.Uninstall.File      = ConvertTo-PortablePath "$($u.File)"
             $Def.Uninstall.Arguments = "$($u.Arguments)"
         }
+        # The uninstall was proven by its outcome (entry gone, detection negative); if the uninstaller reports that
+        # with a non-standard exit code (Chromium's setup.exe: 19 = uninstall successful), the package must accept it.
+        if ($null -ne $u.ExitCode -and @(0, 1641, 3010) -notcontains [int]$u.ExitCode) { $Def.Uninstall.SuccessExitCodes = @([int]$u.ExitCode) }
     }
     elseif ($entry)
     {
+        $pattern = Get-VersionedNamePattern -DisplayName "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)"
         $Def.Uninstall.Type        = 'Name'
-        $Def.Uninstall.Name        = "$($entry.DisplayName)"
+        $Def.Uninstall.Name        = $(if ($pattern) { $pattern } else { "$($entry.DisplayName)" })
         $Def.Uninstall.NameIsRegex = $false
     }
+    elseif ($fp -and (@($fp.Folders).Count + @($fp.Shortcuts).Count + @($fp.RegistryKeys).Count + @($fp.Services).Count + @($fp.Tasks).Count) -gt 0)
+    {
+        $Def.Uninstall.Type         = 'Custom'
+        $Def.Uninstall.CustomScript = New-FootprintUninstallCode -Footprint $fp
+    }
+
+    if ($Auto -and $mainExe -and @($Def.Install.ProcessesToClose | Where-Object { "$_".Trim() }).Count -eq 0)
+    {
+        $Def.Install.ProcessesToClose = @([System.IO.Path]::GetFileNameWithoutExtension($mainExe.Path))
+    }
     return $Def
+}
+
+function Set-DefinitionForPortable
+{
+    # A program with no installer: copy it to Program Files, add a Start menu shortcut; uninstall removes both.
+    param([Parameter(Mandatory)]$Def, [Parameter(Mandatory)]$PackageInput)
+    $exe = Get-Item -LiteralPath $PackageInput.Entry
+    $vi  = $exe.VersionInfo
+    $split = Split-NameAndVersion $PackageInput.NameHint
+    $version = Get-FileVersionText $vi
+    # Trust the product name only when it relates to the program or folder name (a renamed or bundled EXE can carry
+    # someone else's, e.g. "Microsoft Windows Operating System").
+    $name  = Get-CleanAppName -Name "$($vi.ProductName)" -Version $version
+    $alnum = { param($s) ("$s" -replace '[^A-Za-z0-9]', '').ToLowerInvariant() }
+    $pn = & $alnum $name; $eb = & $alnum $exe.BaseName; $hn = & $alnum $split.Name
+    $related = $pn -and (($eb.Length -ge 3 -and ($pn.Contains($eb) -or $eb.Contains($pn))) -or ($hn.Length -ge 3 -and ($pn.Contains($hn) -or $hn.Contains($pn))))
+    if (-not $related)
+    {
+        $name = Get-CleanAppName -Name $split.Name
+        if ($split.Version) { $version = $split.Version }
+    }
+    if (-not $version) { $version = $split.Version }
+    $Def.App.Name    = $name
+    $Def.App.Version = $version
+    $Def.App.Vendor  = Get-CleanVendor -Text "$($vi.CompanyName)" -Path $exe.FullName
+    $arch = Get-ArchFromText "$($exe.Name) $($PackageInput.NameHint)"
+    if (-not $arch) { $arch = Get-PeMachine -Path $exe.FullName }
+    $Def.App.Arch = $arch
+
+    $dirName = (($name -replace '[\\/:*?"<>|]', '') -replace '\s{2,}', ' ').Trim()
+    if (-not $dirName) { $dirName = Get-SafeName $PackageInput.NameHint }
+    $installDir = '$env:ProgramFiles\' + $dirName
+    $exeRel   = $PackageInput.EntryRelative
+    $shortcut = '$env:ProgramData\Microsoft\Windows\Start Menu\Programs\' + $dirName + '.lnk'
+    $q = { param($t) '"' + (ConvertTo-PsExpandableString $t) + '"' }
+
+    $Def.Sources.Files = @($PackageInput.Root.TrimEnd('\') + '\*')
+    $Def.Install.Type  = 'Custom'
+    $Def.Install.File  = ''
+    $Def.Install.ProcessesToClose = @([System.IO.Path]::GetFileNameWithoutExtension($exe.Name))
+    $Def.Install.CustomScript = @(
+        '## Portable program (no installer): copy it to Program Files and add a Start menu shortcut.'
+        '$installDir = ' + (& $q $installDir)
+        'Copy-ADTFile -Path "$($adtSession.DirFiles)\*" -Destination $installDir -Recurse'
+        'New-ADTShortcut -LiteralPath ' + (& $q $shortcut) + ' -TargetPath (Join-Path -Path $installDir -ChildPath ' + (ConvertTo-PsSingleQuoted $exeRel) + ') -WorkingDirectory $installDir'
+    ) -join "`r`n"
+    $Def.Uninstall.Type = 'Custom'
+    $Def.Uninstall.CustomScript = @(
+        '## Remove the copied program and its Start menu shortcut.'
+        '$shortcut = ' + (& $q $shortcut)
+        'if (Test-Path -LiteralPath $shortcut) { Remove-ADTFile -LiteralPath $shortcut }'
+        '$installDir = ' + (& $q $installDir)
+        'if (Test-Path -LiteralPath $installDir) { Remove-ADTFolder -LiteralPath $installDir }'
+    ) -join "`r`n"
+    # Detection compares the file version, so the minimum must be the file's own (not a version from the zip name).
+    $fileVersion = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
+    if ($fileVersion -eq '0.0.0.0') { $fileVersion = '' }
+    $Def.Detection.Type             = 'File'
+    $Def.Detection.FilePath         = $installDir + '\' + $exeRel
+    $Def.Detection.MinVersion       = $fileVersion
+    $Def.Detection.CheckFileVersion = [bool]$fileVersion
+    return $Def
+}
+
+function New-AutoPackageReport
+{
+    # AutoPackage-Report.md: what was decided, why, and what the sandbox proved.
+    param([Parameter(Mandatory)]$Context)
+    $c   = $Context
+    $def = $c.Definition
+    $L = New-Object System.Collections.Generic.List[string]
+    $L.Add("# Auto-package report: $("$($def.App.Vendor) $($def.App.Name) $($def.App.Version)".Trim())")
+    $L.Add('')
+    $statusText = switch ($c.Status)
+    {
+        'Validated'      { 'VALIDATED - installed, detected, uninstalled and confirmed gone in Windows Sandbox as SYSTEM, the way Intune runs it.' }
+        'Built'          { 'BUILT, NOT VALIDATED - the package was generated but not run end to end (see notes).' }
+        default          { 'NEEDS ATTENTION - see the warnings below before deploying.' }
+    }
+    $L.Add("**Status:** $statusText")
+    $L.Add('')
+    $L.Add("Input: ``$($c.InputPath)`` ($($c.Input.Kind)$(if ($c.Info -and $c.Info.Engine -and $c.Info.Engine -notin @('MSI', 'MSIX', 'Script')) { ", $($script:SilentPresets[$c.Info.Engine].Label)" }))  ")
+    $L.Add("Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by PSADT Packager $script:PackagerVersion.")
+    $L.Add('')
+    if (@($c.Warnings).Count -gt 0)
+    {
+        $L.Add('## Warnings')
+        $L.Add('')
+        foreach ($w in $c.Warnings) { $L.Add("- $w") }
+        $L.Add('')
+    }
+    $L.Add('## What was decided')
+    $L.Add('')
+    $L.Add('| Setting | Value | How it was determined |')
+    $L.Add('| --- | --- | --- |')
+    foreach ($row in @($c.Decisions)) { $L.Add("| $($row.Setting) | $(($row.Value -replace '\|', '\|') -replace "`r?`n", ' ') | $($row.Basis) |") }
+    $L.Add('')
+
+    $v = $null
+    if ($c.Validation) { $v = $c.Validation.Validation }
+    $L.Add('## End-to-end test')
+    $L.Add('')
+    if ($v)
+    {
+        $fmt = { param($r) if (-not $r) { 'not run' } elseif ($r.Stuck) { "STUCK: $($r.Stuck)" } elseif ($r.TimedOut) { 'timed out' } else { "exit $($r.ExitCode) in $($r.DurationSec)s" } }
+        $L.Add('| Step | Result |')
+        $L.Add('| --- | --- |')
+        $L.Add("| Install (``Invoke-AppDeployToolkit.exe -DeploymentType Install -DeployMode Silent`` as SYSTEM) | $(& $fmt $v.Install) $(if ($v.InstallOk) { '- OK' } else { '- FAILED' }) |")
+        $L.Add("| Detection after install | $(if ($v.DetectAfterInstall.Detected) { "$($v.DetectAfterInstall.Output)" } else { "NOT detected (exit $($v.DetectAfterInstall.ExitCode))" }) |")
+        $L.Add("| Uninstall | $(& $fmt $v.Uninstall) $(if ($v.UninstallOk) { '- OK' } else { '- FAILED' }) |")
+        $L.Add("| Detection after uninstall | $(if ($v.DetectAfterUninstall.Detected) { "STILL detected: $($v.DetectAfterUninstall.Output)" } else { 'Not detected - OK' }) |")
+        $L.Add('')
+        $left = $v.Leftovers
+        $leftItems = @(@($left.Entries) + @($left.Folders | ForEach-Object { $_.Path }) + @($left.Shortcuts | ForEach-Object { $_.Path }) + @($left.Services | ForEach-Object { "service $($_.Name)" }) + @($left.Tasks) + @($left.RegistryKeys)) | Where-Object { $_ }
+        if ($leftItems.Count -gt 0)
+        {
+            $L.Add('Left behind after uninstall (worth a look; often settings or caches the vendor keeps on purpose):')
+            $L.Add('')
+            foreach ($i in $leftItems) { $L.Add("- ``$i``") }
+            $L.Add('')
+        }
+        $L.Add('Toolkit logs from the test run are in `Validation\`.')
+    }
+    else
+    {
+        $L.Add("Not run. $($c.ValidationNote)")
+    }
+    $L.Add('')
+
+    if (@($c.Probe).Count -gt 0)
+    {
+        $L.Add('## Sandbox runs of the installer')
+        $L.Add('')
+        $n = 0
+        foreach ($r in @($c.Probe))
+        {
+            $n++
+            $outcome = if ($r.InstallSucceeded) { 'installed silently' } else { Get-ProbeFailureReason -Result $r }
+            $L.Add("$n. ``$($c.Input.EntryRelative) $($r.Candidate)`` - $outcome")
+        }
+        $L.Add('')
+        $win = @($c.Probe | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
+        if ($win)
+        {
+            $fp = $win.Footprint
+            $L.Add('What the install created:')
+            $L.Add('')
+            foreach ($e in @($win.NewEntries)) { $L.Add("- Uninstall entry: $($e.DisplayName) $($e.DisplayVersion) ($($e.Location)$(if ($e.SystemComponent -eq 1) { ', hidden' }))") }
+            foreach ($f in @($fp.Folders)) { $L.Add("- Folder: ``$($f.Path)``") }
+            foreach ($s in @($fp.Shortcuts)) { $L.Add("- Shortcut: ``$($s.Path)``") }
+            foreach ($s in @($fp.Services)) { $L.Add("- Service: $($s.Name) ($($s.DisplayName))") }
+            foreach ($t in @($fp.Tasks)) { $L.Add("- Scheduled task: ``$t``") }
+            foreach ($k in @($fp.RegistryKeys)) { $L.Add("- Registry key: ``$k``") }
+            $L.Add('')
+        }
+        $help = @($c.Probe | Where-Object { $_.Help -and "$($_.Help.Text)".Trim() }) | Select-Object -First 1
+        if ($help)
+        {
+            $L.Add("Help text the installer showed for ``$($help.Help.Switch)``:")
+            $L.Add('')
+            $L.Add('```')
+            $L.Add(("$($help.Help.Text)".Trim() -split "`r?`n" | Select-Object -First 40) -join "`r`n")
+            $L.Add('```')
+            $L.Add('')
+        }
+    }
+    if (@($c.Notes).Count -gt 0)
+    {
+        $L.Add('## Notes')
+        $L.Add('')
+        foreach ($n in $c.Notes) { $L.Add("- $n") }
+        $L.Add('')
+    }
+    return (($L -join "`r`n") + "`r`n")
+}
+
+function Get-AutoDecisions
+{
+    # One row per setting for the report: the value that went into the package and the evidence behind it.
+    param($Def, $PackageInput, $Info, $Win, [int]$Attempts, [int]$WinAttempt)
+    $rows = New-Object System.Collections.Generic.List[object]
+    $add = { param($s, $v, $b) $rows.Add([pscustomobject]@{ Setting = $s; Value = "$v"; Basis = $b }) }
+    $entry = $null
+    if ($Win) { $entry = $Win.PrimaryEntry }
+    $fromFile = switch ($PackageInput.Kind) { 'MSI' { 'MSI Property table' } 'MSIX' { 'package manifest' } 'Portable' { "version resource of $([System.IO.Path]::GetFileName($PackageInput.Entry))" } default { 'version resource of the installer' } }
+
+    & $add 'Name' $Def.App.Name $(if ($entry -and $Def.App.Name -eq (Get-CleanAppName -Name "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)")) { 'DisplayName of the uninstall entry the installer created, version and architecture stripped' } elseif ($PackageInput.Kind -eq 'Script' -or -not $Info -or -not $Info.Name) { "Folder / file name ($($PackageInput.NameHint))" } else { "$fromFile, version and architecture stripped" })
+    & $add 'Vendor' $Def.App.Vendor $(if ($entry -and $entry.Publisher -and $Def.App.Vendor -eq "$($entry.Publisher)".Trim()) { 'Publisher of the uninstall entry the installer created' } elseif ($Def.App.Vendor) { $fromFile } else { 'Not found - fill in' })
+    & $add 'Version' $Def.App.Version $(if ($entry -and $entry.DisplayVersion -and $Def.App.Version -eq (Get-CleanVersion "$($entry.DisplayVersion)")) { 'DisplayVersion of the uninstall entry the installer created' } elseif ($PackageInput.Kind -ne 'Script' -and $Info -and $Info.Version -eq $Def.App.Version) { $fromFile } elseif ($Def.App.Version -and "$($PackageInput.NameHint)$([System.IO.Path]::GetFileName($PackageInput.Entry))" -match [regex]::Escape($Def.App.Version)) { "Folder / file name ($($PackageInput.NameHint))" } else { 'Not found - a default; check it' })
+    & $add 'Architecture' $Def.App.Arch $(if ($Def.App.Arch) { 'MSI template, file name, PE header or registry view of the uninstall entry' } else { 'Unknown - the app is allowed on x86 and x64' })
+
+    $i = $Def.Install
+    switch ($i.Type)
+    {
+        'MSI'    { & $add 'Install' "$($i.File) $($i.Arguments)".Trim() 'Windows Installer: Start-ADTMsiProcess adds /qn, /norestart and a verbose log' }
+        'EXE'    { & $add 'Install' "$($i.File) $($i.Arguments)" $(if ($Win) { "Proven silent in Windows Sandbox as SYSTEM (attempt $WinAttempt of $Attempts)" } else { 'Installer-type default - NOT proven' }) }
+        'Script' { & $add 'Install' "$($i.File) $($i.Arguments)".Trim() $(if ($Win) { 'Runs the script; ran cleanly as SYSTEM in Windows Sandbox' } else { 'Runs the script - not tested' }) }
+        'MSIX'   { & $add 'Install' $i.File 'Provisioned for all users with Add-AppxProvisionedPackage' }
+        'Custom' { & $add 'Install' 'Copy to Program Files + Start menu shortcut' 'Portable program - no installer in the input' }
+    }
+    $u = $Def.Uninstall
+    $ub = switch ($u.Type)
+    {
+        'MSI'    { if ($Win -and $Win.Uninstall -and $Win.Uninstall.Verified) { 'MSI product code from the uninstall entry; uninstall proven in Sandbox' } else { 'MSI product code read from the MSI' } }
+        'EXE'    { 'Uninstall command the installer registered; proven in Sandbox (entry removed, detection negative)' }
+        'Name'
+        {
+            if (-not $entry) { 'Guessed from the product name - NOT proven (nothing was installed in Sandbox)' }
+            elseif ($Win.Uninstall -and $Win.Uninstall.Verified) { 'Runs the uninstall command the installer registered (looked up by its exact DisplayName at uninstall time), with the arguments proven in Sandbox; it keeps working after the app updates itself' }
+            elseif ($Win.Uninstall) { 'Registered uninstall command, by the DisplayName the installer registered (it did not prove silent in Sandbox - check)' }
+            else { 'Registered uninstall command, by the DisplayName the installer registered' }
+        }
+        'Script' { 'Uninstall script shipped with the app' }
+        'MSIX'   { 'Removes the provisioned and installed package' }
+        'Custom' { if ($PackageInput.Kind -eq 'Portable') { 'Removes the copied folder and shortcut' } else { 'Generated from what the install created in Sandbox - review' } }
+        default  { 'None' }
+    }
+    $uv = switch ($u.Type)
+    {
+        'MSI'    { $(if ("$($u.ProductCode)".Trim()) { "$($u.ProductCode)".Trim() } else { "$($i.ProductCode)".Trim() }) }
+        'EXE'    { "`"$($u.File)`" $($u.Arguments)" }
+        'Name'   { "$($u.Name) $($u.Arguments)".Trim() }
+        'Script' { $u.File }
+        'MSIX'   { $u.PackageName }
+        'Custom'
+        {
+            if ($Win -and $Win.Footprint -and $PackageInput.Kind -ne 'Portable')
+            {
+                $fp = $Win.Footprint
+                $items = @(@($fp.Services | ForEach-Object { "service $($_.Name)" }) + @($fp.Tasks | ForEach-Object { "task $_" }) + @($fp.Shortcuts | ForEach-Object { ConvertTo-PortablePath $_.Path }) + @($fp.Folders | Where-Object { -not $_.PerUser } | ForEach-Object { ConvertTo-PortablePath $_.Path }) + @($fp.RegistryKeys)) | Where-Object { $_ }
+                'Removes ' + ($items -join ', ')
+            }
+            elseif ($PackageInput.Kind -eq 'Portable') { 'Removes ' + (Split-Path -Path $Def.Detection.FilePath -Parent) + ' and its Start menu shortcut' }
+            else { 'Custom script (Uninstall tab)' }
+        }
+        default  { '' }
+    }
+    & $add 'Uninstall' $uv $ub
+    $d = $Def.Detection
+    $dv = switch ($d.Type) { 'MSI' { "Product code $($d.ProductCode)$(if ($d.MinVersion) { ", version >= $($d.MinVersion)" })" } 'Registry' { "DisplayName $($d.MatchMode.ToLower()) '$($d.DisplayName)'$(if ($d.MinVersion) { ", version >= $($d.MinVersion)" })" } 'File' { "$($d.FilePath)$(if ($d.CheckFileVersion -and $d.MinVersion) { " version >= $($d.MinVersion)" })" } 'MSIX' { "Package $($d.PackageName)" } default { (("$($d.Script)" -split "`r?`n") | Where-Object { $_ -and $_ -notmatch '^\s*#' } | Select-Object -First 1) } }
+    $db = switch ($d.Type) { 'MSI' { 'MSI product code' } 'Registry' { if ($entry) { 'Uninstall entry the installer created in Sandbox' } else { 'Guessed from the product name - not proven' } } 'File' { if ($PackageInput.Kind -eq 'Portable') { 'The copied program file' } else { 'Main program file the install created in Sandbox' } } 'MSIX' { 'Package identity' } default { 'Generated from what the install created in Sandbox' } }
+    & $add 'Detection' $dv $db
+    if (@($i.ProcessesToClose | Where-Object { "$_".Trim() }).Count -gt 0) { & $add 'Processes to close' (@($i.ProcessesToClose) -join ', ') 'Main program the install created; closed before upgrade / uninstall' }
+    return $rows.ToArray()
+}
+
+function Invoke-AutoPackage
+{
+    # Drop anything -> a built, tested package. Reads the file, runs it in Windows Sandbox as SYSTEM to learn the silent
+    # switches, uninstall and detection, builds the PSADT package, runs the package end to end in a fresh sandbox, and
+    # writes AutoPackage-Report.md next to it.
+    param
+    (
+        [Parameter(Mandatory)][string]$Path,
+        $BaseDefinition,
+        [string]$Destination,
+        [switch]$NoSandbox,
+        [switch]$SkipValidation,
+        [switch]$Force,
+        [int]$MaxAttempts = 4,
+        [scriptblock]$ConfirmOverwrite,
+        [scriptblock]$OnProgress            # called as (stage, message, definition or $null, installer info) at each step
+    )
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $notes    = New-Object System.Collections.Generic.List[string]
+    $info     = $null
+    $progress = { param($Stage, $Message, $Definition) if ($OnProgress) { & $OnProgress $Stage $Message $Definition $info } }
+    $Path = (Resolve-Path -LiteralPath $Path).Path
+    & $progress 'Reading' "Reading $(Split-Path -Path $Path -Leaf)..." $null
+    $in = Resolve-PackageInput -Path $Path
+    foreach ($n in @($in.Notes)) { $notes.Add($n) }
+    Write-PackagerLog "Auto-package: $($in.Kind) $($in.Entry)"
+
+    # Start clean, keeping the user's own settings.
+    $def = New-PackageDefinition
+    if ($BaseDefinition)
+    {
+        if ("$($BaseDefinition.App.Author)".Trim())          { $def.App.Author = $BaseDefinition.App.Author }
+        if ("$($BaseDefinition.Output.Destination)".Trim())  { $def.Output.Destination = $BaseDefinition.Output.Destination }
+        if ("$($BaseDefinition.Output.DeployMode)".Trim())   { $def.Output.DeployMode = $BaseDefinition.Output.DeployMode }
+        if ("$($BaseDefinition.Output.IntuneWinAppUtil)".Trim()) { $def.Output.IntuneWinAppUtil = $BaseDefinition.Output.IntuneWinAppUtil }
+        $def.Intune.TenantId = $BaseDefinition.Intune.TenantId
+        $def.Intune.ClientId = $BaseDefinition.Intune.ClientId
+    }
+    if ($Destination) { $def.Output.Destination = $Destination }
+    if (-not "$($def.Output.Destination)".Trim())
+    {
+        $saved = $null
+        try { if (Test-Path -LiteralPath $script:SettingsPath) { $saved = (Get-Content -LiteralPath $script:SettingsPath -Raw | ConvertFrom-Json).Destination } } catch { }
+        $def.Output.Destination = $(if ("$saved".Trim()) { "$saved" } else { 'C:\Packages' })
+    }
+    $tool = Resolve-IntuneWinAppUtil -Configured $def.Output.IntuneWinAppUtil
+    if (-not $tool)
+    {
+        try { $tool = Get-IntuneWinAppUtil } catch { $warnings.Add("IntuneWinAppUtil.exe could not be downloaded ($($_.Exception.Message)), so no .intunewin was built.") }
+    }
+    if ($tool) { $def.Output.IntuneWinAppUtil = $tool; $def.Output.BuildIntuneWin = $true } else { $def.Output.BuildIntuneWin = $false }
+
+    # 1. What the file itself says.
+    if ($in.Kind -eq 'Portable')
+    {
+        [void](Set-DefinitionForPortable -Def $def -PackageInput $in)
+    }
+    else
+    {
+        $info = Get-InstallerInfo -Path $in.Entry
+        [void](Set-DefinitionFromInstaller -Def $def -Info $info)
+        if ($in.IsFolder)
+        {
+            $def.Sources.Files = @($in.Root.TrimEnd('\') + '\*')
+            $def.Install.File  = $in.EntryRelative
+        }
+        if (@($in.Transforms).Count -gt 0) { $def.Install.Transforms = @($in.Transforms); $notes.Add("Transforms applied: $(@($in.Transforms) -join ', ')") }
+        if ($in.UninstallScript)
+        {
+            $def.Uninstall.Type = 'Script'
+            $def.Uninstall.File = $in.UninstallScript
+            $notes.Add("Uses the shipped uninstall script $($in.UninstallScript).")
+        }
+        $split = Split-NameAndVersion $in.NameHint
+        if ($in.Kind -eq 'Script' -or -not "$($def.App.Name)".Trim()) { $def.App.Name = Get-CleanAppName -Name $split.Name -Version $split.Version }
+        if (-not "$($def.App.Version)".Trim() -and $split.Version) { $def.App.Version = $split.Version }
+    }
+    $what = "$("$($def.App.Name) $($def.App.Version)".Trim())"
+    $next = switch ($in.Kind)
+    {
+        'EXE'      { "Read the installer: $what ($($script:SilentPresets[$info.Engine].Label)). Next: find its silent switches in Windows Sandbox." }
+        'MSI'      { "Read the MSI: $what. An MSI describes itself, so there are no switches to discover. Next: build and test it." }
+        'MSIX'     { "Read the package: $what. Next: build and test it." }
+        'Script'   { "Read the script: $what. Next: run it in Windows Sandbox to see what it installs." }
+        'Portable' { "No installer, so $what will be copied to Program Files with a Start menu shortcut. Next: build and test it." }
+    }
+    & $progress 'Read' $next $def
+
+    # 2. What running it shows (installers and scripts; MSI and MSIX are fully described by the file).
+    $probe = @(); $win = $null
+    $sandbox = $false
+    if (-not $NoSandbox) { $sandbox = [bool](Test-WindowsSandbox) }
+    if (-not $NoSandbox -and -not $sandbox) { $warnings.Add('Windows Sandbox (with wsb.exe) is not available, so nothing was run: switches, uninstall and detection are educated guesses.') }
+    if ($sandbox -and $in.Kind -in @('EXE', 'Script'))
+    {
+        if ($in.Kind -eq 'EXE')
+        {
+            $candidates = @(Get-SilentCandidates -Path $in.Entry -Engine $info.Engine -CurrentArgs $info.InstallArgs -Max $MaxAttempts)
+            $detGuess   = New-DetectionScript -Def $def
+            $uArgs      = "$($info.UninstallArgs)"
+            $help       = '/?'
+        }
+        else
+        {
+            $candidates = @("$($def.Install.Arguments)")
+            $detGuess   = $null
+            $uArgs      = ''
+            $help       = ''
+        }
+        $success = @(@($def.Install.SuccessExitCodes) + @($def.Install.RebootExitCodes) | ForEach-Object { [int]$_ })
+        $entryLeaf = Split-Path -Path $in.Entry -Leaf
+        $onAttempt = {
+            param($Number, $Total, $Candidate)
+            if ($in.Kind -eq 'Script') { & $progress 'Probing' "Running $entryLeaf as SYSTEM in Windows Sandbox to see what it creates..." $null }
+            else { & $progress 'Probing' "Sandbox attempt $Number of ${Total}: running $entryLeaf $Candidate as SYSTEM. Installers that contain MSIs pause about 2 minutes per MSI in the sandbox." $null }
+        }
+        $probe = @(Invoke-SandboxProbe -InstallerPath $in.Entry -SourceRoot $in.Root -CopyWholeSource:$in.IsFolder -Candidates $candidates -DetectionScript $detGuess -UninstallArgs $uArgs -AppNameHint $def.App.Name -SuccessCodes $success -HelpSwitch $help -OnAttempt $onAttempt)
+        $win = @($probe | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
+        if ($win)
+        {
+            [void](Set-DefinitionFromProbe -Def $def -Result $win -Auto -NameHint $in.NameHint)
+            & $progress 'Probed' $(if ($in.Kind -eq 'Script') { 'The script ran cleanly. Detection and uninstall were worked out from what it created.' } else { "Installs silently with '$($win.Candidate)'. Uninstall and detection were worked out from what it created." }) $def
+            $perUser = @($win.Footprint.PerUser) + @($win.NewEntries | Where-Object { $_.Location -like 'CurrentUser*' } | ForEach-Object { "uninstall entry $($_.DisplayName) in HKCU" })
+            if (@($perUser | Where-Object { $_ }).Count -gt 0)
+            {
+                $warnings.Add("This is a per-user installer: run as SYSTEM it installed into the system profile ($(@($perUser) -join '; ')), which no user sees. Look for a machine-wide installer (many vendors ship an MSI), or deploy it in the user context.")
+            }
+            if ($win.Uninstall -and -not $win.Uninstall.Verified -and $def.Uninstall.Type -eq 'Name') { $warnings.Add("The registered uninstall command did not prove silent in Sandbox ($(if ($win.Uninstall.Stuck) { $win.Uninstall.Stuck } elseif (-not $win.Uninstall.EntryRemoved) { 'the uninstall entry was still there afterwards' } else { 'detection still found the app' })). The package uninstalls by name instead; check it.") }
+        }
+        else
+        {
+            if ($in.Kind -eq 'Script')
+            {
+                $warnings.Add("The script did not run cleanly in Windows Sandbox: $((Get-ProbeFailureReason -Result @($probe)[0] -SuccessCodes $success).TrimEnd('.')). Detection and uninstall could not be worked out; set them on the tabs.")
+            }
+            else
+            {
+                $why = (@($probe | ForEach-Object { "[$($_.Candidate)] $(Get-ProbeFailureReason -Result $_ -SuccessCodes $success)" })) -join '; '
+                $warnings.Add("No silent install was found: $why. Check the help text in this report, enter the right switches on the Install tab and run 'Find switches in Sandbox' again.")
+            }
+        }
+    }
+
+    # 3. Build.
+    if (-not "$($def.App.Version)".Trim()) { $def.App.Version = '1.0.0'; $warnings.Add('No version found anywhere; used 1.0.0. Set the real version on the Application tab.') }
+    $context = [pscustomobject]@{
+        Status = 'NeedsAttention'; InputPath = $Path; Input = $in; Info = $info; Definition = $def; Probe = $probe; Validation = $null
+        ValidationNote = ''; Warnings = $warnings; Notes = $notes; Decisions = @(); PackageRoot = $null; ReportPath = $null
+    }
+    $problems = Test-PackageDefinition -Def $def
+    if ($problems.Count -gt 0)
+    {
+        foreach ($p in $problems) { $warnings.Add("Not built: $p") }
+        $context.Decisions = Get-AutoDecisions -Def $def -PackageInput $in -Info $info -Win $win -Attempts @($probe).Count -WinAttempt ([Array]::IndexOf(@($probe), $win) + 1)
+        Write-PackagerLog ('Auto-package stopped before building: ' + ($problems -join ' ')) -Level Warn
+        return $context
+    }
+    $paths = Get-PackagePaths -Def $def
+    $overwrite = [bool]$Force
+    if ((Test-Path -LiteralPath $paths.Package) -and -not $overwrite)
+    {
+        if ($ConfirmOverwrite -and (& $ConfirmOverwrite $paths.Root)) { $overwrite = $true }
+        else { throw "A package already exists at $($paths.Root). Use -Force (or confirm) to rebuild it." }
+    }
+    & $progress 'Building' 'Building the PSADT package and .intunewin...' $null
+    $root = Invoke-PackageBuild -Def $def -Force:$overwrite
+    $context.PackageRoot = $root
+
+    # 4. Prove the package itself.
+    if ($SkipValidation) { $context.ValidationNote = 'Skipped on request.' }
+    elseif (-not $sandbox) { $context.ValidationNote = $(if ($NoSandbox) { 'Sandbox runs were turned off (-NoSandbox).' } else { 'Windows Sandbox is not available.' }) }
+    elseif ($in.Kind -in @('EXE', 'Script') -and -not $win) { $context.ValidationNote = 'Skipped: no silent install was found, so the package would only hang.' }
+    else
+    {
+        $codes = @(@($def.Install.SuccessExitCodes) + @($def.Install.RebootExitCodes) | ForEach-Object { [int]$_ })
+        & $progress 'Validating' 'Testing the finished package in a fresh Windows Sandbox as SYSTEM: install, detect, uninstall, detect again...' $null
+        $context.Validation = Invoke-SandboxValidation -PackageRoot $root -DetectName $paths.DetectName -SuccessCodes $codes
+        if (-not $context.Validation) { $context.ValidationNote = 'The sandbox returned no result; see the run folder under %LOCALAPPDATA%\PsadtPackager\Sandbox.' }
+        elseif ($context.Validation.Error -and -not $context.Validation.Validation) { $context.ValidationNote = "The sandbox reported: $($context.Validation.Error)" }
+    }
+
+    $v = $null
+    if ($context.Validation) { $v = $context.Validation.Validation }
+    if ($v -and -not $v.Passed)
+    {
+        $failed = @()
+        if (-not $v.InstallOk) { $failed += 'the install failed' }
+        if (-not $v.DetectAfterInstall.Detected) { $failed += 'detection did not find the app after install' }
+        if (-not $v.UninstallOk) { $failed += 'the uninstall failed' }
+        if ($v.DetectAfterUninstall.Detected) { $failed += 'detection still found the app after uninstall' }
+        $warnings.Add("End-to-end test failed: $($failed -join ', '). The toolkit logs are in Validation\.")
+    }
+    $hardProblem = ($warnings | Where-Object { $_ -match '^(No silent install|The script did not run cleanly|End-to-end test failed|This is a per-user installer|Not built)' }).Count -gt 0
+    if ($v -and $v.Passed -and -not $hardProblem) { $context.Status = 'Validated' }
+    elseif (-not $hardProblem) { $context.Status = 'Built' }
+    else { $context.Status = 'NeedsAttention' }
+
+    $context.Decisions = Get-AutoDecisions -Def $def -PackageInput $in -Info $info -Win $win -Attempts @($probe).Count -WinAttempt ([Array]::IndexOf(@($probe), $win) + 1)
+    $reportPath = Join-Path $root 'AutoPackage-Report.md'
+    Write-Utf8File -Path $reportPath -Content (New-AutoPackageReport -Context $context)
+    $context.ReportPath = $reportPath
+    Write-PackagerLog "Auto-package finished: $($context.Status). Report: $reportPath"
+    return $context
 }
 
 #endregion
@@ -2650,7 +4331,52 @@ function Publish-IntuneWin32App
 
 if ($NoGui)
 {
-    if (-not $Definition) { throw 'Specify -Definition <Package.json> with -NoGui.' }
+    if (-not $Definition -and -not $InstallerPath) { throw 'Specify -Definition <Package.json> or -InstallerPath <installer, script, zip or folder> with -NoGui.' }
+    if ($InstallerPath)
+    {
+        try
+        {
+            # Saved GUI settings (author, destination, tool path, tenant) apply to headless runs too.
+            $base = New-PackageDefinition
+            try
+            {
+                if (Test-Path -LiteralPath $script:SettingsPath)
+                {
+                    $saved = Get-Content -LiteralPath $script:SettingsPath -Raw | ConvertFrom-Json
+                    if ($saved.Author)           { $base.App.Author = "$($saved.Author)" }
+                    if ($saved.Destination)      { $base.Output.Destination = "$($saved.Destination)" }
+                    if ($saved.IntuneWinAppUtil) { $base.Output.IntuneWinAppUtil = "$($saved.IntuneWinAppUtil)" }
+                    if ($saved.TenantId)         { $base.Intune.TenantId = "$($saved.TenantId)" }
+                    if ($saved.ClientId)         { $base.Intune.ClientId = "$($saved.ClientId)" }
+                }
+            }
+            catch { }
+            if ($TenantId) { $base.Intune.TenantId = $TenantId }
+            if ($ClientId) { $base.Intune.ClientId = $ClientId }
+            $ctx = Invoke-AutoPackage -Path $InstallerPath -BaseDefinition $base -Destination $Destination -NoSandbox:$NoSandbox -SkipValidation:$SkipValidation -Force:$Force
+            foreach ($w in @($ctx.Warnings)) { Write-PackagerLog $w -Level Warn }
+            Write-PackagerLog "Status: $($ctx.Status)$(if ($ctx.ReportPath) { " - $($ctx.ReportPath)" })"
+            if (-not $ctx.PackageRoot) { exit 2 }
+            if ($Publish)
+            {
+                if ($ctx.Status -eq 'NeedsAttention') { Write-PackagerLog 'Not publishing: the package needs attention (see the report).' -Level Warn }
+                else
+                {
+                    [void](Connect-IntuneGraph -TenantId $ctx.Definition.Intune.TenantId -ClientId $ctx.Definition.Intune.ClientId -Silent)
+                    $app = Publish-IntuneWin32App -Def $ctx.Definition
+                    Write-PackagerLog "Intune app id $($app.Id)"
+                }
+            }
+            Write-Output $ctx.PackageRoot
+            if ($ctx.Status -eq 'NeedsAttention') { exit 2 }
+            exit 0
+        }
+        catch
+        {
+            Write-PackagerLog -Message $_.Exception.Message -Level Error
+            exit 1
+        }
+    }
     try
     {
         $def = Read-PackageDefinition -Path (Resolve-Path -LiteralPath $Definition).Path
@@ -2690,442 +4416,962 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA')
     # Quoted: the script or definition path may contain spaces (Documents, OneDrive, ...).
     $relaunchArgs = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
     if ($Definition) { $relaunchArgs += @('-Definition', ('"{0}"' -f (Resolve-Path -LiteralPath $Definition).Path)) }
+    if ($InstallerPath) { $relaunchArgs += @('-InstallerPath', ('"{0}"' -f (Resolve-Path -LiteralPath $InstallerPath).Path)) }
+    if ($NoSandbox) { $relaunchArgs += '-NoSandbox' }
+    if ($SkipValidation) { $relaunchArgs += '-SkipValidation' }
     Start-Process -FilePath $exe -ArgumentList $relaunchArgs
     return
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
+# Our own app identity, set before any window exists: without it the taskbar groups this window under
+# powershell.exe and shows PowerShell's icon. The MSI's Start menu shortcut carries the same ID, so the taskbar
+# button, pinning and Alt+Tab all show PSADT Packager.
+try
+{
+    Add-Type -Namespace PsadtPackager -Name Shell32 -MemberDefinition '[DllImport("shell32.dll")] public static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);'
+    [void][PsadtPackager.Shell32]::SetCurrentProcessExplicitAppUserModelID('YeomanLabs.PSADTPackager')
+}
+catch { }
+
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="PSADT Packager" Width="1080" Height="840" MinWidth="960" MinHeight="720"
-        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="12" Background="#F3F3F3">
+        Title="PSADT Packager" Width="1120" Height="900" MinWidth="980" MinHeight="760" AllowDrop="True"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        Background="#F3F3F3" Foreground="#1B1B1B" UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display">
   <Window.Resources>
+    <!-- Palette: YeomanLabs navy for primary actions and focus, coral for the selected tab and progress. -->
+    <SolidColorBrush x:Key="Navy" Color="#041635"/>
+    <SolidColorBrush x:Key="NavyHover" Color="#13305E"/>
+    <SolidColorBrush x:Key="Focus" Color="#2A5BA0"/>
+    <SolidColorBrush x:Key="Coral" Color="#FF6950"/>
+    <SolidColorBrush x:Key="Line" Color="#E3E3E3"/>
+    <SolidColorBrush x:Key="ControlLine" Color="#CFCFCF"/>
+    <SolidColorBrush x:Key="Subtle" Color="#5F5F5F"/>
+
+    <!-- The app mark (same drawing as PsadtPackager.ico): window icon when the .ico is not next to the script. -->
+    <DrawingImage x:Key="AppIcon">
+      <DrawingImage.Drawing>
+        <DrawingGroup>
+          <GeometryDrawing Brush="{StaticResource Navy}">
+            <GeometryDrawing.Geometry>
+              <RectangleGeometry Rect="8,8,240,240" RadiusX="52" RadiusY="52"/>
+            </GeometryDrawing.Geometry>
+          </GeometryDrawing>
+          <GeometryDrawing Geometry="M 56 128 L 56 204 L 200 204 L 200 128 M 40 128 L 92 128 M 164 128 L 216 128">
+            <GeometryDrawing.Pen>
+              <Pen Brush="White" Thickness="18" StartLineCap="Round" EndLineCap="Round" LineJoin="Round"/>
+            </GeometryDrawing.Pen>
+          </GeometryDrawing>
+          <GeometryDrawing Brush="{StaticResource Coral}" Geometry="M 110 40 L 146 40 L 146 112 L 178 112 L 128 168 L 78 112 L 110 112 Z"/>
+          <GeometryDrawing Brush="Transparent" Geometry="M 0 0 L 256 256"/>
+        </DrawingGroup>
+      </DrawingImage.Drawing>
+    </DrawingImage>
+
     <Style TargetType="Label">
       <Setter Property="Margin" Value="0,2,8,2"/>
       <Setter Property="VerticalAlignment" Value="Top"/>
-      <Setter Property="Padding" Value="0,5,0,0"/>
+      <Setter Property="Padding" Value="0,6,0,0"/>
+      <Setter Property="Foreground" Value="#3A3A3A"/>
     </Style>
+
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="Foreground" Value="#1B1B1B"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLine}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="14,6"/>
+      <Setter Property="Margin" Value="6,3,0,3"/>
+      <Setter Property="MinWidth" Value="96"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter Property="Background" Value="#F7F7F7"/>
+          <Setter Property="BorderBrush" Value="#B4B4B4"/>
+        </Trigger>
+        <Trigger Property="IsPressed" Value="True">
+          <Setter Property="Background" Value="#ECECEC"/>
+        </Trigger>
+        <Trigger Property="IsKeyboardFocused" Value="True">
+          <Setter Property="BorderBrush" Value="{StaticResource Focus}"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+
+    <Style x:Key="Primary" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="{StaticResource Navy}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Navy}"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter Property="Background" Value="{StaticResource NavyHover}"/>
+          <Setter Property="BorderBrush" Value="{StaticResource NavyHover}"/>
+        </Trigger>
+        <Trigger Property="IsPressed" Value="True">
+          <Setter Property="Background" Value="#020B1C"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+
     <Style TargetType="TextBox">
       <Setter Property="Margin" Value="0,3,0,3"/>
-      <Setter Property="Padding" Value="3"/>
+      <Setter Property="Padding" Value="6,4"/>
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLine}"/>
+      <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5">
+              <ScrollViewer x:Name="PART_ContentHost" Focusable="False"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#A8A8A8"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Focus}"/>
+                <Setter TargetName="Bd" Property="BorderThickness" Value="1,1,1,2"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Bd" Property="Background" Value="#F6F6F6"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#E2E2E2"/>
+                <Setter Property="Foreground" Value="#9A9A9A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
-    <Style TargetType="ComboBox">
-      <Setter Property="Margin" Value="0,3,0,3"/>
-      <Setter Property="Padding" Value="4,3"/>
-    </Style>
-    <Style TargetType="CheckBox">
-      <Setter Property="Margin" Value="0,6,14,4"/>
-      <Setter Property="VerticalAlignment" Value="Center"/>
-    </Style>
-    <Style TargetType="Button">
-      <Setter Property="Margin" Value="6,3,0,3"/>
-      <Setter Property="Padding" Value="12,4"/>
-      <Setter Property="MinWidth" Value="96"/>
-    </Style>
-    <Style x:Key="Code" TargetType="TextBox">
-      <Setter Property="FontFamily" Value="Consolas"/>
+
+    <Style x:Key="Code" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+      <Setter Property="FontFamily" Value="Cascadia Mono, Consolas"/>
       <Setter Property="FontSize" Value="12"/>
       <Setter Property="AcceptsReturn" Value="True"/>
       <Setter Property="AcceptsTab" Value="True"/>
       <Setter Property="VerticalScrollBarVisibility" Value="Auto"/>
       <Setter Property="HorizontalScrollBarVisibility" Value="Auto"/>
       <Setter Property="TextWrapping" Value="NoWrap"/>
-      <Setter Property="Margin" Value="0,3,0,3"/>
-      <Setter Property="Padding" Value="3"/>
+      <Setter Property="Padding" Value="6,5"/>
       <Setter Property="VerticalContentAlignment" Value="Top"/>
     </Style>
+
+    <!-- ComboBox: one template for both the drop-down list and the editable kind. -->
+    <ControlTemplate x:Key="ComboToggle" TargetType="ToggleButton">
+      <Border x:Name="Bd" Background="White" BorderBrush="{StaticResource ControlLine}" BorderThickness="1" CornerRadius="5">
+        <Path x:Name="Arrow" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,11,0"
+              Data="M 0 0 L 4.5 4.5 L 9 0" Stroke="#5F5F5F" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+      </Border>
+      <ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter TargetName="Bd" Property="BorderBrush" Value="#A8A8A8"/>
+        </Trigger>
+        <Trigger Property="IsChecked" Value="True">
+          <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Focus}"/>
+        </Trigger>
+        <Trigger Property="IsEnabled" Value="False">
+          <Setter TargetName="Bd" Property="Background" Value="#F6F6F6"/>
+          <Setter TargetName="Bd" Property="BorderBrush" Value="#E2E2E2"/>
+          <Setter TargetName="Arrow" Property="Stroke" Value="#B5B5B5"/>
+        </Trigger>
+      </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <Style TargetType="ComboBox">
+      <Setter Property="Margin" Value="0,3,0,3"/>
+      <Setter Property="Padding" Value="8,5,30,5"/>
+      <Setter Property="MinHeight" Value="29"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <ToggleButton x:Name="Toggle" Template="{StaticResource ComboToggle}" Focusable="False" ClickMode="Press"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"/>
+              <ContentPresenter x:Name="Selected" IsHitTestVisible="False" Margin="{TemplateBinding Padding}"
+                                VerticalAlignment="Center" HorizontalAlignment="Left"
+                                Content="{TemplateBinding SelectionBoxItem}"
+                                ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"/>
+              <TextBox x:Name="PART_EditableTextBox" Style="{x:Null}" Visibility="Hidden" Margin="2,2,28,2" Padding="5,3"
+                       VerticalContentAlignment="Center" Background="Transparent" BorderThickness="0"
+                       IsReadOnly="{Binding IsReadOnly, RelativeSource={RelativeSource TemplatedParent}}"/>
+              <Popup x:Name="PART_Popup" Placement="Bottom" AllowsTransparency="True" Focusable="False" PopupAnimation="Slide"
+                     IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <Border Background="White" BorderBrush="#D6D6D6" BorderThickness="1" CornerRadius="6" Margin="0,4,0,0" Padding="3"
+                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                        MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                  <ScrollViewer>
+                    <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsEditable" Value="True">
+                <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="Selected" Property="Visibility" Value="Hidden"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="#9A9A9A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="Padding" Value="8,5"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#F1F1F1"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#E5ECF6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="CheckBox">
+      <Setter Property="Margin" Value="0,7,18,4"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <StackPanel Orientation="Horizontal" Background="Transparent">
+              <Border x:Name="Box" Width="18" Height="18" CornerRadius="4" BorderBrush="#8A8A8A" BorderThickness="1" Background="White" VerticalAlignment="Center">
+                <Path x:Name="Mark" Data="M 3.5 9 L 7.3 12.6 L 14 5.4" Stroke="White" StrokeThickness="2"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Visibility="Collapsed"/>
+              </Border>
+              <ContentPresenter Margin="8,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Box" Property="BorderBrush" Value="{StaticResource Focus}"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Box" Property="Background" Value="{StaticResource Navy}"/>
+                <Setter TargetName="Box" Property="BorderBrush" Value="{StaticResource Navy}"/>
+                <Setter TargetName="Mark" Property="Visibility" Value="Visible"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ListBox">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLine}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBox">
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="3">
+              <ScrollViewer Focusable="False">
+                <ItemsPresenter/>
+              </ScrollViewer>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ListBoxItem">
+      <Setter Property="Padding" Value="8,4"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#F3F3F3"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#E5ECF6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- Thin scroll bars. -->
+    <Style x:Key="ScrollThumb" TargetType="Thumb">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Thumb">
+            <Border x:Name="T" Background="#BDBDBD" CornerRadius="3"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="T" Property="Background" Value="#959595"/>
+              </Trigger>
+              <Trigger Property="IsDragging" Value="True">
+                <Setter TargetName="T" Property="Background" Value="#7A7A7A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="ScrollPage" TargetType="RepeatButton">
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="IsTabStop" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RepeatButton">
+            <Border Background="Transparent"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Width" Value="10"/>
+      <Setter Property="MinWidth" Value="10"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageUpCommand"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Style="{StaticResource ScrollThumb}" Margin="2,2"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageDownCommand"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="Width" Value="Auto"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="Height" Value="10"/>
+          <Setter Property="MinHeight" Value="10"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ScrollBar">
+                <Grid Background="Transparent">
+                  <Track x:Name="PART_Track" IsDirectionReversed="False">
+                    <Track.DecreaseRepeatButton>
+                      <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageLeftCommand"/>
+                    </Track.DecreaseRepeatButton>
+                    <Track.Thumb>
+                      <Thumb Style="{StaticResource ScrollThumb}" Margin="2,2"/>
+                    </Track.Thumb>
+                    <Track.IncreaseRepeatButton>
+                      <RepeatButton Style="{StaticResource ScrollPage}" Command="ScrollBar.PageRightCommand"/>
+                    </Track.IncreaseRepeatButton>
+                  </Track>
+                </Grid>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+
+    <!-- Tabs: plain text with a coral bar under the selected one. -->
+    <Style TargetType="TabControl">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabControl">
+            <DockPanel>
+              <Border DockPanel.Dock="Top" BorderBrush="#DEDEDE" BorderThickness="0,0,0,1" Margin="0,0,0,14">
+                <TabPanel IsItemsHost="True" Background="Transparent"/>
+              </Border>
+              <ContentPresenter ContentSource="SelectedContent"/>
+            </DockPanel>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="TabItem">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Grid Background="Transparent" Margin="0,0,2,0">
+              <ContentPresenter x:Name="Hdr" ContentSource="Header" Margin="14,8,14,11" TextElement.Foreground="#5F5F5F"/>
+              <Border x:Name="Bar" Height="3" CornerRadius="1.5" Background="{StaticResource Coral}" VerticalAlignment="Bottom" Margin="14,0,14,-1" Visibility="Hidden"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Hdr" Property="TextElement.Foreground" Value="#1B1B1B"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bar" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="Hdr" Property="TextElement.Foreground" Value="#1B1B1B"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="22,18"/>
+    </Style>
+
+    <Style TargetType="ProgressBar">
+      <Setter Property="Height" Value="4"/>
+      <Setter Property="Foreground" Value="{StaticResource Coral}"/>
+      <Setter Property="Background" Value="#E9E9E9"/>
+      <Setter Property="BorderThickness" Value="0"/>
+    </Style>
+
+    <Style TargetType="GridSplitter">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="GridSplitter">
+            <Grid Background="Transparent">
+              <Border Width="44" Height="4" CornerRadius="2" Background="#CACACA" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <Style x:Key="Hint" TargetType="TextBlock">
-      <Setter Property="Foreground" Value="#5A5A5A"/>
+      <Setter Property="Foreground" Value="{StaticResource Subtle}"/>
       <Setter Property="TextWrapping" Value="Wrap"/>
-      <Setter Property="Margin" Value="0,0,0,8"/>
+      <Setter Property="Margin" Value="0,0,0,10"/>
+      <Setter Property="LineHeight" Value="18"/>
     </Style>
     <Style x:Key="Section" TargetType="TextBlock">
       <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontSize" Value="14"/>
       <Setter Property="Margin" Value="0,4,0,4"/>
     </Style>
   </Window.Resources>
+
   <DockPanel>
-    <Menu DockPanel.Dock="Top">
-      <MenuItem Header="_File">
-        <MenuItem Name="MenuNew" Header="_New definition"/>
-        <MenuItem Name="MenuOpen" Header="_Open definition..."/>
-        <MenuItem Name="MenuSave" Header="_Save definition"/>
-        <MenuItem Name="MenuSaveAs" Header="Save definition _as..."/>
-        <Separator/>
-        <MenuItem Name="MenuExit" Header="E_xit"/>
-      </MenuItem>
-      <MenuItem Header="_Help">
-        <MenuItem Name="MenuAbout" Header="_About"/>
-      </MenuItem>
-    </Menu>
-    <StatusBar DockPanel.Dock="Bottom">
-      <TextBlock Name="StatusText" Text="Ready"/>
-    </StatusBar>
-    <Grid Margin="8">
+    <!-- Header -->
+    <Border DockPanel.Dock="Top" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="22,12,14,12">
+      <DockPanel>
+        <Menu DockPanel.Dock="Right" VerticalAlignment="Center" Background="Transparent" FontSize="13">
+          <MenuItem Header="_File" Padding="10,5">
+            <MenuItem Name="MenuNew" Header="_New definition"/>
+            <MenuItem Name="MenuOpen" Header="_Open definition..."/>
+            <MenuItem Name="MenuSave" Header="_Save definition"/>
+            <MenuItem Name="MenuSaveAs" Header="Save definition _as..."/>
+            <Separator/>
+            <MenuItem Name="MenuExit" Header="E_xit"/>
+          </MenuItem>
+          <MenuItem Header="_Help" Padding="10,5">
+            <MenuItem Name="MenuAbout" Header="_About"/>
+          </MenuItem>
+        </Menu>
+        <Viewbox Width="36" Height="36" Margin="0,0,14,0" VerticalAlignment="Center">
+          <Canvas Width="256" Height="256">
+            <Rectangle Width="240" Height="240" Canvas.Left="8" Canvas.Top="8" RadiusX="52" RadiusY="52" Fill="{StaticResource Navy}"/>
+            <Path Stroke="White" StrokeThickness="18" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                  Data="M 56 128 L 56 204 L 200 204 L 200 128 M 40 128 L 92 128 M 164 128 L 216 128"/>
+            <Path Fill="{StaticResource Coral}" Data="M 110 40 L 146 40 L 146 112 L 178 112 L 128 168 L 78 112 L 110 112 Z"/>
+          </Canvas>
+        </Viewbox>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="PSADT Packager" FontSize="17" FontWeight="SemiBold"/>
+          <TextBlock Text="PSAppDeployToolkit packages for Intune, worked out and tested in Windows Sandbox" Foreground="{StaticResource Subtle}" FontSize="12"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- Status bar -->
+    <Border DockPanel.Dock="Bottom" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="22,7,22,7">
+      <DockPanel>
+        <ProgressBar Name="StatusProgress" DockPanel.Dock="Right" Width="180" IsIndeterminate="True" VerticalAlignment="Center" Visibility="Collapsed"/>
+        <TextBlock Name="StatusText" Text="Ready" Foreground="{StaticResource Subtle}" TextTrimming="CharacterEllipsis" Margin="0,0,16,0"/>
+      </DockPanel>
+    </Border>
+
+    <Grid Margin="22,14,22,14">
       <Grid.RowDefinitions>
         <RowDefinition Height="*"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="150" MinHeight="60"/>
+        <RowDefinition Height="14"/>
+        <RowDefinition Height="160" MinHeight="70"/>
       </Grid.RowDefinitions>
       <TabControl Name="Tabs" Grid.Row="0">
 
-        <TabItem Header="  1. Application  ">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="150"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Start with the installer: 'Read metadata from installer' fills vendor, name, version, product code, silent switches, uninstall and detection from the MSI / EXE / MSIX. Adjust anything afterwards."/>
-            <Button Grid.Row="1" Grid.Column="1" Name="BtnImportInstaller" Content="Read metadata from installer..." HorizontalAlignment="Left" Margin="0,0,0,12"/>
-            <Label Grid.Row="2" Content="Vendor"/>
-            <TextBox Grid.Row="2" Grid.Column="1" Name="AppVendor"/>
-            <Label Grid.Row="3" Content="Application name"/>
-            <TextBox Grid.Row="3" Grid.Column="1" Name="AppName"/>
-            <Label Grid.Row="4" Content="Version"/>
-            <TextBox Grid.Row="4" Grid.Column="1" Name="AppVersion" Width="220" HorizontalAlignment="Left"/>
-            <Label Grid.Row="5" Content="Architecture"/>
-            <ComboBox Grid.Row="5" Grid.Column="1" Name="AppArch" Width="140" HorizontalAlignment="Left" IsEditable="True"/>
-            <Label Grid.Row="6" Content="Language"/>
-            <TextBox Grid.Row="6" Grid.Column="1" Name="AppLang" Width="80" HorizontalAlignment="Left"/>
-            <Label Grid.Row="7" Content="Revision"/>
-            <TextBox Grid.Row="7" Grid.Column="1" Name="AppRevision" Width="80" HorizontalAlignment="Left"/>
-            <Label Grid.Row="8" Content="Script version"/>
-            <TextBox Grid.Row="8" Grid.Column="1" Name="AppScriptVersion" Width="140" HorizontalAlignment="Left"/>
-            <Label Grid.Row="9" Content="Script author"/>
-            <TextBox Grid.Row="9" Grid.Column="1" Name="AppAuthor" Width="300" HorizontalAlignment="Left"/>
-            <TextBlock Grid.Row="10" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,12,0,0"
-                       Text="The output folder is named Vendor_Name_Version. Vendor, name and version also drive the PSADT dialog titles and log file names."/>
-          </Grid>
-        </TabItem>
-
-        <TabItem Header="  2. Source files  ">
-          <Grid Margin="12">
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Style="{StaticResource Hint}"
-                       Text="Everything listed here is copied into the package. Files\ is for the installer, transforms, patches and scripts the deployment runs. SupportFiles\ is for anything else (config files, licences, fonts). 'Add folder contents' copies the files inside a folder; 'Add folder' copies the folder itself."/>
-            <DockPanel Grid.Row="1">
-              <TextBlock Style="{StaticResource Section}" Text="Files\" VerticalAlignment="Center"/>
-              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Name="BtnFilesAdd" Content="Add files..."/>
-                <Button Name="BtnFilesAddFolder" Content="Add folder..."/>
-                <Button Name="BtnFilesAddContents" Content="Add folder contents..."/>
-                <Button Name="BtnFilesRemove" Content="Remove selected"/>
-              </StackPanel>
-            </DockPanel>
-            <ListBox Grid.Row="2" Name="FilesList" SelectionMode="Extended" FontFamily="Consolas" Margin="0,2,0,10"/>
-            <DockPanel Grid.Row="3">
-              <TextBlock Style="{StaticResource Section}" Text="SupportFiles\" VerticalAlignment="Center"/>
-              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Name="BtnSupportAdd" Content="Add files..."/>
-                <Button Name="BtnSupportAddFolder" Content="Add folder..."/>
-                <Button Name="BtnSupportAddContents" Content="Add folder contents..."/>
-                <Button Name="BtnSupportRemove" Content="Remove selected"/>
-              </StackPanel>
-            </DockPanel>
-            <ListBox Grid.Row="5" Name="SupportList" SelectionMode="Extended" FontFamily="Consolas" Margin="0,2,0,0"/>
-          </Grid>
-        </TabItem>
-
-        <TabItem Header="  3. Install  ">
+        <TabItem Header="Application">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <Grid Margin="12">
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="170"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              </Grid.RowDefinitions>
-              <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                         Text="Defines the Install phase of Invoke-AppDeployToolkit.ps1 (Repair re-uses it). Pre/post PowerShell runs inside the toolkit session, so every *-ADT* function and $adtSession are available."/>
-              <Label Grid.Row="1" Content="Install type"/>
-              <ComboBox Grid.Row="1" Grid.Column="1" Name="InstallType" Width="360" HorizontalAlignment="Left"/>
-              <Label Grid.Row="2" Content="Installer file"/>
-              <DockPanel Grid.Row="2" Grid.Column="1">
-                <Button DockPanel.Dock="Right" Name="BtnInstallAutoFill" Content="Auto-fill from file"/>
-                <ComboBox Name="InstallFile" IsEditable="True"/>
-              </DockPanel>
-              <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Hint}" Text="File name inside Files\ (pick from the list or type a relative path such as Setup\install.exe)."/>
-              <Label Grid.Row="4" Content="Arguments"/>
-              <DockPanel Grid.Row="4" Grid.Column="1">
-                <Button DockPanel.Dock="Right" Name="BtnProbeSandbox" Content="Find switches in Sandbox..." Margin="6,3,0,3" ToolTip="Runs the installer inside Windows Sandbox with candidate silent switches, records what gets registered and tests the uninstall. Nothing runs on this PC."/>
-                <ComboBox DockPanel.Dock="Right" Name="InstallPreset" Width="200" Margin="6,3,0,3"/>
-                <TextBox Name="InstallArgs" FontFamily="Consolas"/>
-              </DockPanel>
-              <TextBlock Grid.Row="5" Grid.Column="1" Style="{StaticResource Hint}" Name="InstallArgsHint" Text="EXE: silent switches. MSI: extra properties appended to the toolkit's /QN (e.g. ALLUSERS=1 ADDLOCAL=ALL). Script: parameters in PowerShell syntax."/>
-              <Label Grid.Row="6" Content="MST transforms"/>
-              <TextBox Grid.Row="6" Grid.Column="1" Name="InstallTransforms" FontFamily="Consolas"/>
-              <Label Grid.Row="7" Content="MSI product code"/>
-              <TextBox Grid.Row="7" Grid.Column="1" Name="InstallProductCode" FontFamily="Consolas" Width="360" HorizontalAlignment="Left"/>
-              <Label Grid.Row="8" Content="Processes to close"/>
-              <TextBox Grid.Row="8" Grid.Column="1" Name="CloseProcesses"/>
-              <TextBlock Grid.Row="9" Grid.Column="1" Style="{StaticResource Hint}" Text="Comma-separated process names without .exe. Optional friendly name with a pipe: winword|Microsoft Word, excel|Microsoft Excel"/>
-              <Label Grid.Row="10" Content="Exit codes"/>
-              <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
-                <Label Content="Success" Padding="0,5,0,0"/>
-                <TextBox Name="SuccessCodes" Width="160" FontFamily="Consolas"/>
-                <Label Content="Reboot" Margin="16,2,8,2" Padding="0,5,0,0"/>
-                <TextBox Name="RebootCodes" Width="160" FontFamily="Consolas"/>
-              </StackPanel>
-              <Label Grid.Row="11" Content="Dialogs"/>
-              <WrapPanel Grid.Row="11" Grid.Column="1">
-                <CheckBox Name="ShowWelcome" Content="Welcome / close-apps dialog"/>
-                <CheckBox Name="AllowDefer" Content="Allow defer"/>
-                <TextBox Name="DeferTimes" Width="40" Margin="0,3,4,3"/>
-                <Label Content="times" Padding="0,5,14,0"/>
-                <CheckBox Name="ShowProgress" Content="Progress dialog"/>
-                <CheckBox Name="ShowCompletion" Content="Completion prompt"/>
-              </WrapPanel>
-              <Label Grid.Row="12" Content="Pre-install PowerShell"/>
-              <TextBox Grid.Row="12" Grid.Column="1" Name="InstallPre" Style="{StaticResource Code}" Height="90"/>
-              <Label Grid.Row="13" Content="Custom install PowerShell"/>
-              <TextBox Grid.Row="13" Grid.Column="1" Name="InstallCustom" Style="{StaticResource Code}" Height="120"/>
-              <Label Grid.Row="14" Content="Post-install PowerShell"/>
-              <TextBox Grid.Row="14" Grid.Column="1" Name="InstallPost" Style="{StaticResource Code}" Height="90"/>
-            </Grid>
+            <StackPanel>
+              <!-- Drop zone: also shows progress and the result of an auto-package run. -->
+              <Grid Name="DropZone" Margin="0,0,0,14">
+                <Rectangle Name="DropZoneRect" RadiusX="10" RadiusY="10" Fill="White" Stroke="#B9B9B9" StrokeThickness="1.5" StrokeDashArray="5 4"/>
+                <Grid Margin="26,22,26,22">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Viewbox Width="54" Height="54" VerticalAlignment="Top" Margin="0,2,22,0">
+                    <Canvas Width="256" Height="256">
+                      <Rectangle Width="240" Height="240" Canvas.Left="8" Canvas.Top="8" RadiusX="52" RadiusY="52" Fill="#FFF1EE"/>
+                      <Path Stroke="{StaticResource Navy}" StrokeThickness="18" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                            Data="M 56 128 L 56 204 L 200 204 L 200 128 M 40 128 L 92 128 M 164 128 L 216 128"/>
+                      <Path Fill="{StaticResource Coral}" Data="M 110 40 L 146 40 L 146 112 L 178 112 L 128 168 L 78 112 L 110 112 Z"/>
+                    </Canvas>
+                  </Viewbox>
+                  <StackPanel Grid.Column="1">
+                    <TextBlock Name="DropTitle" Text="Drop an installer, script, .zip or folder here" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    <TextBlock Name="DropDetail" Style="{StaticResource Hint}" Margin="0,6,0,0"
+                               Text="It runs in Windows Sandbox as SYSTEM to find the silent switches, uninstall and detection, builds the package and tests it end to end. The tabs fill in as it learns. .msi, .exe, .msix, .ps1, .cmd, .bat, .vbs, .zip or a folder."/>
+                    <ProgressBar Name="DropProgress" IsIndeterminate="True" Margin="0,14,0,0" Visibility="Collapsed"/>
+                    <TextBlock Name="DropElapsed" Foreground="{StaticResource Subtle}" FontSize="12" Margin="0,6,0,0" Visibility="Collapsed"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
+                      <Button Name="BtnAutoPackage" Style="{StaticResource Primary}" Content="Auto-package a file..." Margin="0,0,0,0"
+                              ToolTip="Pick an installer (.msi, .exe, .msix), script (.ps1, .cmd, .bat, .vbs) or .zip. Folders: drag them onto the window."/>
+                      <Button Name="BtnOpenReport" Content="Open report" Margin="8,0,0,0" Visibility="Collapsed"/>
+                      <Button Name="BtnImportInstaller" Content="Read metadata only..." Margin="8,0,0,0"
+                              ToolTip="Only reads the file and fills the tabs for you to finish by hand; nothing is run."/>
+                    </StackPanel>
+                  </StackPanel>
+                </Grid>
+              </Grid>
+
+              <Border Style="{StaticResource Card}">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                  </Grid.RowDefinitions>
+                  <Label Grid.Row="0" Content="Vendor"/>
+                  <TextBox Grid.Row="0" Grid.Column="1" Name="AppVendor"/>
+                  <Label Grid.Row="1" Content="Application name"/>
+                  <TextBox Grid.Row="1" Grid.Column="1" Name="AppName"/>
+                  <Label Grid.Row="2" Content="Version"/>
+                  <TextBox Grid.Row="2" Grid.Column="1" Name="AppVersion" Width="220" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="3" Content="Architecture"/>
+                  <ComboBox Grid.Row="3" Grid.Column="1" Name="AppArch" Width="140" HorizontalAlignment="Left" IsEditable="True"/>
+                  <Label Grid.Row="4" Content="Language"/>
+                  <TextBox Grid.Row="4" Grid.Column="1" Name="AppLang" Width="80" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="5" Content="Revision"/>
+                  <TextBox Grid.Row="5" Grid.Column="1" Name="AppRevision" Width="80" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="6" Content="Script version"/>
+                  <TextBox Grid.Row="6" Grid.Column="1" Name="AppScriptVersion" Width="140" HorizontalAlignment="Left"/>
+                  <Label Grid.Row="7" Content="Script author"/>
+                  <TextBox Grid.Row="7" Grid.Column="1" Name="AppAuthor" Width="300" HorizontalAlignment="Left"/>
+                  <TextBlock Grid.Row="8" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,12,0,0"
+                             Text="The output folder is named Vendor_Name_Version. Vendor, name and version also drive the PSADT dialog titles and log file names."/>
+                </Grid>
+              </Border>
+            </StackPanel>
           </ScrollViewer>
         </TabItem>
 
-        <TabItem Header="  4. Uninstall  ">
+        <TabItem Header="Source files">
+          <Border Style="{StaticResource Card}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <TextBlock Grid.Row="0" Style="{StaticResource Hint}"
+                         Text="Everything listed here is copied into the package. Files\ is for the installer, transforms, patches and scripts the deployment runs. SupportFiles\ is for anything else (config files, licences, fonts). 'Add folder contents' copies the files inside a folder; 'Add folder' copies the folder itself."/>
+              <DockPanel Grid.Row="1">
+                <TextBlock Style="{StaticResource Section}" Text="Files\" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                  <Button Name="BtnFilesAdd" Content="Add files..."/>
+                  <Button Name="BtnFilesAddFolder" Content="Add folder..."/>
+                  <Button Name="BtnFilesAddContents" Content="Add folder contents..."/>
+                  <Button Name="BtnFilesRemove" Content="Remove selected"/>
+                </StackPanel>
+              </DockPanel>
+              <ListBox Grid.Row="2" Name="FilesList" SelectionMode="Extended" FontFamily="Cascadia Mono, Consolas" FontSize="12" Margin="0,4,0,12"/>
+              <DockPanel Grid.Row="3">
+                <TextBlock Style="{StaticResource Section}" Text="SupportFiles\" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                  <Button Name="BtnSupportAdd" Content="Add files..."/>
+                  <Button Name="BtnSupportAddFolder" Content="Add folder..."/>
+                  <Button Name="BtnSupportAddContents" Content="Add folder contents..."/>
+                  <Button Name="BtnSupportRemove" Content="Remove selected"/>
+                </StackPanel>
+              </DockPanel>
+              <ListBox Grid.Row="5" Name="SupportList" SelectionMode="Extended" FontFamily="Cascadia Mono, Consolas" FontSize="12" Margin="0,4,0,0"/>
+            </Grid>
+          </Border>
+        </TabItem>
+
+        <TabItem Header="Install">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <Grid Margin="12">
+            <Border Style="{StaticResource Card}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="180"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                           Text="Defines the Install phase of Invoke-AppDeployToolkit.ps1 (Repair re-uses it). Pre/post PowerShell runs inside the toolkit session, so every *-ADT* function and $adtSession are available."/>
+                <Label Grid.Row="1" Content="Install type"/>
+                <ComboBox Grid.Row="1" Grid.Column="1" Name="InstallType" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="2" Content="Installer file"/>
+                <DockPanel Grid.Row="2" Grid.Column="1">
+                  <Button DockPanel.Dock="Right" Name="BtnInstallAutoFill" Content="Auto-fill from file"/>
+                  <ComboBox Name="InstallFile" IsEditable="True"/>
+                </DockPanel>
+                <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Hint}" Text="File name inside Files\ (pick from the list or type a relative path such as Setup\install.exe)."/>
+                <Label Grid.Row="4" Content="Arguments"/>
+                <DockPanel Grid.Row="4" Grid.Column="1">
+                  <Button DockPanel.Dock="Right" Name="BtnProbeSandbox" Content="Find switches in Sandbox..." ToolTip="Runs the installer inside Windows Sandbox as SYSTEM with candidate silent switches, records what it creates and tests the uninstall. Nothing runs on this PC."/>
+                  <ComboBox DockPanel.Dock="Right" Name="InstallPreset" Width="210" Margin="6,3,0,3"/>
+                  <TextBox Name="InstallArgs" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                </DockPanel>
+                <TextBlock Grid.Row="5" Grid.Column="1" Style="{StaticResource Hint}" Name="InstallArgsHint" Text="EXE: silent switches. MSI: extra properties appended to the toolkit's /QN (e.g. ALLUSERS=1 ADDLOCAL=ALL). Script: parameters in PowerShell syntax."/>
+                <Label Grid.Row="6" Content="MST transforms"/>
+                <TextBox Grid.Row="6" Grid.Column="1" Name="InstallTransforms" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <Label Grid.Row="7" Content="MSI product code"/>
+                <TextBox Grid.Row="7" Grid.Column="1" Name="InstallProductCode" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="8" Content="Processes to close"/>
+                <TextBox Grid.Row="8" Grid.Column="1" Name="CloseProcesses"/>
+                <TextBlock Grid.Row="9" Grid.Column="1" Style="{StaticResource Hint}" Text="Comma-separated process names without .exe. Optional friendly name with a pipe: winword|Microsoft Word, excel|Microsoft Excel"/>
+                <Label Grid.Row="10" Content="Exit codes"/>
+                <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
+                  <Label Content="Success"/>
+                  <TextBox Name="SuccessCodes" Width="160" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                  <Label Content="Reboot" Margin="18,2,8,2"/>
+                  <TextBox Name="RebootCodes" Width="160" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                </StackPanel>
+                <Label Grid.Row="11" Content="Dialogs"/>
+                <WrapPanel Grid.Row="11" Grid.Column="1">
+                  <CheckBox Name="ShowWelcome" Content="Welcome / close-apps dialog"/>
+                  <CheckBox Name="AllowDefer" Content="Allow defer" Margin="0,7,8,4"/>
+                  <TextBox Name="DeferTimes" Width="44" Margin="0,3,6,3"/>
+                  <Label Content="times" Margin="0,2,18,2"/>
+                  <CheckBox Name="ShowProgress" Content="Progress dialog"/>
+                  <CheckBox Name="ShowCompletion" Content="Completion prompt"/>
+                </WrapPanel>
+                <Label Grid.Row="12" Content="Pre-install PowerShell"/>
+                <TextBox Grid.Row="12" Grid.Column="1" Name="InstallPre" Style="{StaticResource Code}" Height="90"/>
+                <Label Grid.Row="13" Content="Custom install PowerShell"/>
+                <TextBox Grid.Row="13" Grid.Column="1" Name="InstallCustom" Style="{StaticResource Code}" Height="120"/>
+                <Label Grid.Row="14" Content="Post-install PowerShell"/>
+                <TextBox Grid.Row="14" Grid.Column="1" Name="InstallPost" Style="{StaticResource Code}" Height="90"/>
+              </Grid>
+            </Border>
+          </ScrollViewer>
+        </TabItem>
+
+        <TabItem Header="Uninstall">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <Border Style="{StaticResource Card}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="180"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                           Text="Defines the Uninstall phase. 'Installed app by name' searches the Uninstall registry (both views) and runs the registered uninstaller, which is the most robust option for EXE installers."/>
+                <Label Grid.Row="1" Content="Uninstall method"/>
+                <ComboBox Grid.Row="1" Grid.Column="1" Name="UninstallType" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="2" Content="MSI product code"/>
+                <TextBox Grid.Row="2" Grid.Column="1" Name="UninstallProductCode" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="380" HorizontalAlignment="Left"/>
+                <Label Grid.Row="3" Content="Installed app name"/>
+                <DockPanel Grid.Row="3" Grid.Column="1">
+                  <ComboBox DockPanel.Dock="Right" Name="UninstallAppType" Width="90" Margin="6,3,0,3"/>
+                  <Label DockPanel.Dock="Right" Content="App type" Margin="14,2,0,2"/>
+                  <CheckBox DockPanel.Dock="Right" Name="UninstallNameRegex" Content="Regex" Margin="14,7,0,4"/>
+                  <TextBox Name="UninstallName"/>
+                </DockPanel>
+                <TextBlock Grid.Row="4" Grid.Column="1" Style="{StaticResource Hint}" Text="DisplayName as shown in Apps and Features. Wildcards (*) are allowed; tick Regex for a .NET regular expression."/>
+                <Label Grid.Row="5" Content="Uninstaller / script"/>
+                <TextBox Grid.Row="5" Grid.Column="1" Name="UninstallFile" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="EXE method: full path on the device, $env:ProgramFiles etc. allowed. Script method: .ps1, .cmd, .bat or .vbs file name inside Files\."/>
+                <Label Grid.Row="7" Content="Arguments"/>
+                <DockPanel Grid.Row="7" Grid.Column="1">
+                  <TextBox DockPanel.Dock="Right" Name="UninstallSuccessCodes" Width="120" Margin="8,3,0,3" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                           ToolTip="Extra exit codes that mean the uninstall worked (Chromium-based browsers return 19). They are ignored, so the package still exits 0 for Intune."/>
+                  <Label DockPanel.Dock="Right" Content="Success exit codes" Margin="14,2,0,2"/>
+                  <TextBox Name="UninstallArgs" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                </DockPanel>
+                <Label Grid.Row="8" Content="MSIX package name"/>
+                <TextBox Grid.Row="8" Grid.Column="1" Name="UninstallPackageName" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <Label Grid.Row="9" Content="Pre-uninstall PowerShell"/>
+                <TextBox Grid.Row="9" Grid.Column="1" Name="UninstallPre" Style="{StaticResource Code}" Height="90"/>
+                <Label Grid.Row="10" Content="Custom uninstall PowerShell"/>
+                <TextBox Grid.Row="10" Grid.Column="1" Name="UninstallCustom" Style="{StaticResource Code}" Height="120"/>
+                <Label Grid.Row="11" Content="Post-uninstall PowerShell"/>
+                <TextBox Grid.Row="11" Grid.Column="1" Name="UninstallPost" Style="{StaticResource Code}" Height="90"/>
+              </Grid>
+            </Border>
+          </ScrollViewer>
+        </TabItem>
+
+        <TabItem Header="Detection">
+          <Border Style="{StaticResource Card}">
+            <Grid>
               <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="170"/>
+                <ColumnDefinition Width="180"/>
                 <ColumnDefinition Width="*"/>
               </Grid.ColumnDefinitions>
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
               </Grid.RowDefinitions>
               <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                         Text="Defines the Uninstall phase. 'Installed app by name' searches the Uninstall registry (both views) and runs the registered uninstaller, which is the most robust option for EXE installers."/>
-              <Label Grid.Row="1" Content="Uninstall method"/>
-              <ComboBox Grid.Row="1" Grid.Column="1" Name="UninstallType" Width="360" HorizontalAlignment="Left"/>
+                         Text="Generates the Intune custom detection script (exit 0 + STDOUT = installed). Registry methods check the 64-bit and 32-bit HKLM views and HKCU. Minimum version makes the rule 'this version or newer', which keeps upgrades detected correctly."/>
+              <Label Grid.Row="1" Content="Detection method"/>
+              <ComboBox Grid.Row="1" Grid.Column="1" Name="DetectType" Width="380" HorizontalAlignment="Left"/>
               <Label Grid.Row="2" Content="MSI product code"/>
-              <TextBox Grid.Row="2" Grid.Column="1" Name="UninstallProductCode" FontFamily="Consolas" Width="360" HorizontalAlignment="Left"/>
-              <Label Grid.Row="3" Content="Installed app name"/>
-              <DockPanel Grid.Row="3" Grid.Column="1">
-                <ComboBox DockPanel.Dock="Right" Name="UninstallAppType" Width="80" Margin="6,3,0,3"/>
-                <Label DockPanel.Dock="Right" Content="App type" Margin="12,2,0,2"/>
-                <CheckBox DockPanel.Dock="Right" Name="UninstallNameRegex" Content="Regex" Margin="12,6,0,4"/>
-                <TextBox Name="UninstallName"/>
+              <TextBox Grid.Row="2" Grid.Column="1" Name="DetectProductCode" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="380" HorizontalAlignment="Left"/>
+              <Label Grid.Row="3" Content="Minimum version"/>
+              <TextBox Grid.Row="3" Grid.Column="1" Name="DetectMinVersion" FontFamily="Cascadia Mono, Consolas" FontSize="12" Width="220" HorizontalAlignment="Left"/>
+              <Label Grid.Row="4" Content="Display name"/>
+              <DockPanel Grid.Row="4" Grid.Column="1">
+                <ComboBox DockPanel.Dock="Right" Name="DetectMatchMode" Width="120" Margin="6,3,0,3"/>
+                <TextBox Name="DetectDisplayName"/>
               </DockPanel>
-              <TextBlock Grid.Row="4" Grid.Column="1" Style="{StaticResource Hint}" Text="DisplayName as shown in Apps and Features. Wildcards (*) are allowed; tick Regex for a .NET regular expression."/>
-              <Label Grid.Row="5" Content="Uninstaller / script"/>
-              <TextBox Grid.Row="5" Grid.Column="1" Name="UninstallFile" FontFamily="Consolas"/>
-              <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="EXE method: full path on the device, $env:ProgramFiles etc. allowed. Script method: .ps1 file name inside Files\."/>
-              <Label Grid.Row="7" Content="Arguments"/>
-              <TextBox Grid.Row="7" Grid.Column="1" Name="UninstallArgs" FontFamily="Consolas"/>
-              <Label Grid.Row="8" Content="MSIX package name"/>
-              <TextBox Grid.Row="8" Grid.Column="1" Name="UninstallPackageName" FontFamily="Consolas"/>
-              <Label Grid.Row="9" Content="Pre-uninstall PowerShell"/>
-              <TextBox Grid.Row="9" Grid.Column="1" Name="UninstallPre" Style="{StaticResource Code}" Height="90"/>
-              <Label Grid.Row="10" Content="Custom uninstall PowerShell"/>
-              <TextBox Grid.Row="10" Grid.Column="1" Name="UninstallCustom" Style="{StaticResource Code}" Height="120"/>
-              <Label Grid.Row="11" Content="Post-uninstall PowerShell"/>
-              <TextBox Grid.Row="11" Grid.Column="1" Name="UninstallPost" Style="{StaticResource Code}" Height="90"/>
+              <Label Grid.Row="5" Content="File path"/>
+              <DockPanel Grid.Row="5" Grid.Column="1">
+                <CheckBox DockPanel.Dock="Right" Name="DetectCheckVersion" Content="Compare file version" Margin="14,7,0,4"/>
+                <TextBox Name="DetectFilePath" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+              </DockPanel>
+              <Label Grid.Row="6" Content="MSIX package name"/>
+              <TextBox Grid.Row="6" Grid.Column="1" Name="DetectPackageName" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+              <Label Grid.Row="7" Content="Custom script"/>
+              <TextBox Grid.Row="7" Grid.Column="1" Name="DetectScript" Style="{StaticResource Code}" Height="120"/>
+              <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal" Margin="0,8,0,4">
+                <Button Name="BtnDetectPreview" Content="Preview detection script" Margin="0,3,0,3"/>
+                <Button Name="BtnDetectTest" Content="Run preview on this PC"/>
+                <TextBlock Name="DetectTestResult" VerticalAlignment="Center" Margin="14,0,0,0" FontWeight="SemiBold"/>
+              </StackPanel>
+              <TextBox Grid.Row="9" Grid.Column="1" Name="DetectPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
             </Grid>
-          </ScrollViewer>
+          </Border>
         </TabItem>
 
-        <TabItem Header="  5. Detection  ">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="170"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Generates the Intune custom detection script (exit 0 + STDOUT = installed). Registry methods check the 64-bit and 32-bit HKLM views and HKCU. Minimum version makes the rule 'this version or newer', which keeps upgrades detected correctly."/>
-            <Label Grid.Row="1" Content="Detection method"/>
-            <ComboBox Grid.Row="1" Grid.Column="1" Name="DetectType" Width="360" HorizontalAlignment="Left"/>
-            <Label Grid.Row="2" Content="MSI product code"/>
-            <TextBox Grid.Row="2" Grid.Column="1" Name="DetectProductCode" FontFamily="Consolas" Width="360" HorizontalAlignment="Left"/>
-            <Label Grid.Row="3" Content="Minimum version"/>
-            <TextBox Grid.Row="3" Grid.Column="1" Name="DetectMinVersion" FontFamily="Consolas" Width="200" HorizontalAlignment="Left"/>
-            <Label Grid.Row="4" Content="Display name"/>
-            <DockPanel Grid.Row="4" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Right" Name="DetectMatchMode" Width="110" Margin="6,3,0,3"/>
-              <TextBox Name="DetectDisplayName"/>
-            </DockPanel>
-            <Label Grid.Row="5" Content="File path"/>
-            <DockPanel Grid.Row="5" Grid.Column="1">
-              <CheckBox DockPanel.Dock="Right" Name="DetectCheckVersion" Content="Compare file version" Margin="12,6,0,4"/>
-              <TextBox Name="DetectFilePath" FontFamily="Consolas"/>
-            </DockPanel>
-            <Label Grid.Row="6" Content="MSIX package name"/>
-            <TextBox Grid.Row="6" Grid.Column="1" Name="DetectPackageName" FontFamily="Consolas"/>
-            <Label Grid.Row="7" Content="Custom script"/>
-            <TextBox Grid.Row="7" Grid.Column="1" Name="DetectScript" Style="{StaticResource Code}" Height="120"/>
-            <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal" Margin="0,6,0,2">
-              <Button Name="BtnDetectPreview" Content="Preview detection script" Margin="0,3,0,3"/>
-              <Button Name="BtnDetectTest" Content="Run preview on this PC"/>
-              <TextBlock Name="DetectTestResult" VerticalAlignment="Center" Margin="12,0,0,0" FontWeight="SemiBold"/>
-            </StackPanel>
-            <TextBox Grid.Row="9" Grid.Column="1" Name="DetectPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
-          </Grid>
+        <TabItem Header="Build">
+          <Border Style="{StaticResource Card}">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="180"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                         Text="Output: Destination\Vendor_Name_Version\ with Package\ (the PSADT folder to wrap), Detect-Name.ps1, Package.json, README.md with the Intune settings, and optionally Intune\Vendor_Name_Version.intunewin."/>
+              <Label Grid.Row="1" Content="Destination folder"/>
+              <DockPanel Grid.Row="1" Grid.Column="1">
+                <Button DockPanel.Dock="Right" Name="BtnBrowseDest" Content="Browse..."/>
+                <TextBox Name="OutDestination"/>
+              </DockPanel>
+              <Label Grid.Row="2" Content="Intune deploy mode"/>
+              <DockPanel Grid.Row="2" Grid.Column="1">
+                <ComboBox DockPanel.Dock="Left" Name="OutDeployMode" Width="170" VerticalAlignment="Top"/>
+                <TextBlock Style="{StaticResource Hint}" Margin="14,8,0,0" Text="Used in the README install/uninstall command lines. Silent = no dialogs (Required apps); Auto = dialogs when a user is logged on."/>
+              </DockPanel>
+              <Label Grid.Row="3" Content="Options"/>
+              <WrapPanel Grid.Row="3" Grid.Column="1">
+                <CheckBox Name="OutOverwrite" Content="Overwrite existing Package folder"/>
+                <CheckBox Name="OutBuildIntuneWin" Content="Build .intunewin"/>
+              </WrapPanel>
+              <Label Grid.Row="4" Content="IntuneWinAppUtil.exe"/>
+              <DockPanel Grid.Row="4" Grid.Column="1">
+                <Button DockPanel.Dock="Right" Name="BtnDownloadTool" Content="Download"/>
+                <Button DockPanel.Dock="Right" Name="BtnBrowseTool" Content="Browse..."/>
+                <TextBox Name="OutIntuneWinTool"/>
+              </DockPanel>
+              <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,12,0,4">
+                <Button Name="BtnGenerate" Style="{StaticResource Primary}" Content="Generate package" Margin="0,3,0,3"/>
+                <Button Name="BtnPreviewScript" Content="Preview deployment script"/>
+                <Button Name="BtnOpenOutput" Content="Open output folder"/>
+              </StackPanel>
+              <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,4,0,10" Text="Generate copies sources, creates the PSADT template (downloads the toolkit once if needed), writes the scripts, syntax-checks them and saves Package.json next to the package."/>
+              <TextBox Grid.Row="7" Grid.Column="1" Name="OutPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
+            </Grid>
+          </Border>
         </TabItem>
 
-        <TabItem Header="  6. Build  ">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="170"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Output: Destination\Vendor_Name_Version\ with Package\ (the PSADT folder to wrap), Detect-Name.ps1, Package.json, README.md with the Intune settings, and optionally Intune\Vendor_Name_Version.intunewin."/>
-            <Label Grid.Row="1" Content="Destination folder"/>
-            <DockPanel Grid.Row="1" Grid.Column="1">
-              <Button DockPanel.Dock="Right" Name="BtnBrowseDest" Content="Browse..."/>
-              <TextBox Name="OutDestination"/>
-            </DockPanel>
-            <Label Grid.Row="2" Content="Intune deploy mode"/>
-            <DockPanel Grid.Row="2" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Left" Name="OutDeployMode" Width="160" VerticalAlignment="Top"/>
-              <TextBlock Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Used in the README install/uninstall command lines. Silent = no dialogs (Required apps); Auto = dialogs when a user is logged on."/>
-            </DockPanel>
-            <Label Grid.Row="3" Content="Options"/>
-            <WrapPanel Grid.Row="3" Grid.Column="1">
-              <CheckBox Name="OutOverwrite" Content="Overwrite existing Package folder"/>
-              <CheckBox Name="OutBuildIntuneWin" Content="Build .intunewin"/>
-            </WrapPanel>
-            <Label Grid.Row="4" Content="IntuneWinAppUtil.exe"/>
-            <DockPanel Grid.Row="4" Grid.Column="1">
-              <Button DockPanel.Dock="Right" Name="BtnDownloadTool" Content="Download"/>
-              <Button DockPanel.Dock="Right" Name="BtnBrowseTool" Content="Browse..."/>
-              <TextBox Name="OutIntuneWinTool"/>
-            </DockPanel>
-            <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,4">
-              <Button Name="BtnGenerate" Content="Generate package" FontWeight="Bold" Padding="18,6" Margin="0,3,0,3"/>
-              <Button Name="BtnPreviewScript" Content="Preview deployment script"/>
-              <Button Name="BtnOpenOutput" Content="Open output folder"/>
-            </StackPanel>
-            <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="Generate copies sources, creates the PSADT template (downloads the toolkit once if needed), writes the scripts, syntax-checks them and saves Package.json next to the package."/>
-            <TextBox Grid.Row="7" Grid.Column="1" Name="OutPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA"/>
-          </Grid>
-        </TabItem>
-
-        <TabItem Header="  7. Intune  " Name="TabIntune">
+        <TabItem Header="Intune" Name="TabIntune">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
-          <Grid Margin="12">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="170"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
-            </Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="180"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
 
-            <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
-                       Text="Everything below is filled in from the other tabs; anything you type here overrides it. Publish creates the Win32 app, uploads the .intunewin and sets the commands, detection rule, return codes and requirements. Assignments are left for you."/>
+                <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Style="{StaticResource Hint}"
+                           Text="Everything below is filled in from the other tabs; anything you type here overrides it. Publish creates the Win32 app, uploads the .intunewin and sets the commands, detection rule, return codes and requirements. Assignments are left for you."/>
 
-            <Label Grid.Row="1" Content="Tenant"/>
-            <DockPanel Grid.Row="1" Grid.Column="1">
-              <Button DockPanel.Dock="Right" Name="BtnGraphConnect" Content="Connect..." Padding="14,4"/>
-              <TextBox Name="IntTenantId" Width="260" HorizontalAlignment="Left"/>
-              <TextBlock Name="IntConnStatus" Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Not connected. Blank tenant = whichever tenant you sign in to."/>
-            </DockPanel>
+                <Label Grid.Row="1" Content="Tenant"/>
+                <DockPanel Grid.Row="1" Grid.Column="1">
+                  <Button DockPanel.Dock="Right" Name="BtnGraphConnect" Content="Connect..."/>
+                  <TextBox Name="IntTenantId" Width="260" HorizontalAlignment="Left"/>
+                  <TextBlock Name="IntConnStatus" Style="{StaticResource Hint}" Margin="14,8,0,0" Text="Not connected. Blank tenant = whichever tenant you sign in to."/>
+                </DockPanel>
 
-            <Label Grid.Row="2" Content="App registration"/>
-            <DockPanel Grid.Row="2" Grid.Column="1">
-              <TextBox Name="IntClientId" Width="330" HorizontalAlignment="Left"/>
-              <TextBlock Style="{StaticResource Hint}" Margin="12,6,0,0" Text="Blank = Microsoft Graph PowerShell client. Needs DeviceManagementApps.ReadWrite.All."/>
-            </DockPanel>
+                <Label Grid.Row="2" Content="App registration"/>
+                <DockPanel Grid.Row="2" Grid.Column="1">
+                  <TextBox Name="IntClientId" Width="330" HorizontalAlignment="Left"/>
+                  <TextBlock Style="{StaticResource Hint}" Margin="14,8,0,0" Text="Blank = Microsoft Graph PowerShell client. Needs DeviceManagementApps.ReadWrite.All."/>
+                </DockPanel>
 
-            <Label Grid.Row="3" Content="Name"/>
-            <TextBox Grid.Row="3" Grid.Column="1" Name="IntDisplayName"/>
+                <Label Grid.Row="3" Content="Name"/>
+                <TextBox Grid.Row="3" Grid.Column="1" Name="IntDisplayName"/>
 
-            <Label Grid.Row="4" Content="Publisher"/>
-            <TextBox Grid.Row="4" Grid.Column="1" Name="IntPublisher"/>
+                <Label Grid.Row="4" Content="Publisher"/>
+                <TextBox Grid.Row="4" Grid.Column="1" Name="IntPublisher"/>
 
-            <Label Grid.Row="5" Content="Description"/>
-            <TextBox Grid.Row="5" Grid.Column="1" Name="IntDescription" Height="54" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+                <Label Grid.Row="5" Content="Description"/>
+                <TextBox Grid.Row="5" Grid.Column="1" Name="IntDescription" Height="58" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"/>
 
-            <Label Grid.Row="6" Content="Developer / Owner"/>
-            <DockPanel Grid.Row="6" Grid.Column="1">
-              <TextBox Name="IntDeveloper" Width="300" HorizontalAlignment="Left"/>
-              <TextBox Name="IntOwner" Width="240" Margin="8,3,0,3" HorizontalAlignment="Left"/>
-            </DockPanel>
+                <Label Grid.Row="6" Content="Developer / Owner"/>
+                <DockPanel Grid.Row="6" Grid.Column="1">
+                  <TextBox Name="IntDeveloper" Width="300" HorizontalAlignment="Left"/>
+                  <TextBox Name="IntOwner" Width="240" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+                </DockPanel>
 
-            <Label Grid.Row="7" Content="Information / Privacy URL"/>
-            <DockPanel Grid.Row="7" Grid.Column="1">
-              <TextBox Name="IntInfoUrl" Width="300" HorizontalAlignment="Left"/>
-              <TextBox Name="IntPrivacyUrl" Width="300" Margin="8,3,0,3" HorizontalAlignment="Left"/>
-            </DockPanel>
+                <Label Grid.Row="7" Content="Information / Privacy URL"/>
+                <DockPanel Grid.Row="7" Grid.Column="1">
+                  <TextBox Name="IntInfoUrl" Width="300" HorizontalAlignment="Left"/>
+                  <TextBox Name="IntPrivacyUrl" Width="300" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+                </DockPanel>
 
-            <Label Grid.Row="8" Content="Install command"/>
-            <TextBox Grid.Row="8" Grid.Column="1" Name="IntInstallCmd" Style="{StaticResource Code}"/>
+                <Label Grid.Row="8" Content="Install command"/>
+                <TextBox Grid.Row="8" Grid.Column="1" Name="IntInstallCmd" Style="{StaticResource Code}"/>
 
-            <Label Grid.Row="9" Content="Uninstall command"/>
-            <TextBox Grid.Row="9" Grid.Column="1" Name="IntUninstallCmd" Style="{StaticResource Code}"/>
+                <Label Grid.Row="9" Content="Uninstall command"/>
+                <TextBox Grid.Row="9" Grid.Column="1" Name="IntUninstallCmd" Style="{StaticResource Code}"/>
 
-            <Label Grid.Row="10" Content="Install behavior"/>
-            <DockPanel Grid.Row="10" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Left" Name="IntRunAs" Width="200"/>
-              <ComboBox DockPanel.Dock="Left" Name="IntRestart" Width="290" Margin="8,3,0,3"/>
-              <TextBox Name="IntMaxRunTime" Width="60" Margin="8,3,0,3" HorizontalAlignment="Left"/>
-              <TextBlock Style="{StaticResource Hint}" Margin="8,6,0,0" Text="max run time (minutes)"/>
-            </DockPanel>
+                <Label Grid.Row="10" Content="Install behavior"/>
+                <DockPanel Grid.Row="10" Grid.Column="1">
+                  <ComboBox DockPanel.Dock="Left" Name="IntRunAs" Width="210"/>
+                  <ComboBox DockPanel.Dock="Left" Name="IntRestart" Width="300" Margin="8,3,0,3"/>
+                  <TextBox Name="IntMaxRunTime" Width="60" Margin="8,3,0,3" HorizontalAlignment="Left"/>
+                  <TextBlock Style="{StaticResource Hint}" Margin="8,8,0,0" Text="max run time (minutes)"/>
+                </DockPanel>
 
-            <Label Grid.Row="11" Content="Requirements"/>
-            <DockPanel Grid.Row="11" Grid.Column="1">
-              <ComboBox DockPanel.Dock="Left" Name="IntMinOs" Width="220"/>
-              <ComboBox DockPanel.Dock="Left" Name="IntArch" Width="130" Margin="8,3,0,3" IsEditable="True"/>
-              <CheckBox Name="IntAllowUninstall" Content="Allow uninstall for Available assignments" Margin="12,6,0,0"/>
-            </DockPanel>
+                <Label Grid.Row="11" Content="Requirements"/>
+                <DockPanel Grid.Row="11" Grid.Column="1">
+                  <ComboBox DockPanel.Dock="Left" Name="IntMinOs" Width="230"/>
+                  <ComboBox DockPanel.Dock="Left" Name="IntArch" Width="130" Margin="8,3,0,3" IsEditable="True"/>
+                  <CheckBox Name="IntAllowUninstall" Content="Allow uninstall for Available assignments" Margin="14,7,0,4"/>
+                </DockPanel>
 
-            <Label Grid.Row="12" Content="Detection"/>
-            <TextBlock Grid.Row="12" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,6,0,0"
-                       Text="The script from tab 5 is uploaded as the detection rule (64-bit, no signature check). Return codes come from the Install tab."/>
+                <Label Grid.Row="12" Content="Detection"/>
+                <TextBlock Grid.Row="12" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,8,0,0"
+                           Text="The script from the Detection tab is uploaded as the detection rule (64-bit, no signature check). Return codes come from the Install tab."/>
 
-            <StackPanel Grid.Row="13" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,4">
-              <Button Name="BtnIntunePublish" Content="Publish to Intune" FontWeight="Bold" Padding="18,6" Margin="0,3,0,3"/>
-              <Button Name="BtnIntunePreview" Content="Preview app JSON"/>
-              <Button Name="BtnIntuneReset" Content="Reset to auto values"/>
-            </StackPanel>
+                <StackPanel Grid.Row="13" Grid.Column="1" Orientation="Horizontal" Margin="0,12,0,6">
+                  <Button Name="BtnIntunePublish" Style="{StaticResource Primary}" Content="Publish to Intune" Margin="0,3,0,3"/>
+                  <Button Name="BtnIntunePreview" Content="Preview app JSON"/>
+                  <Button Name="BtnIntuneReset" Content="Reset to auto values"/>
+                </StackPanel>
 
-            <TextBox Grid.Row="14" Grid.Column="1" Name="IntPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA" MinHeight="120"/>
-          </Grid>
+                <TextBox Grid.Row="14" Grid.Column="1" Name="IntPreview" Style="{StaticResource Code}" IsReadOnly="True" Background="#FAFAFA" MinHeight="120"/>
+              </Grid>
+            </Border>
           </ScrollViewer>
         </TabItem>
 
       </TabControl>
-      <GridSplitter Grid.Row="1" Height="5" HorizontalAlignment="Stretch" Background="#D0D0D0" Margin="0,4"/>
-      <TextBox Grid.Row="2" Name="LogBox" Style="{StaticResource Code}" IsReadOnly="True" Background="#1E1E1E" Foreground="#DDDDDD"/>
+      <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ResizeDirection="Rows" Cursor="SizeNS"/>
+      <TextBox Grid.Row="2" Name="LogBox" Style="{StaticResource Code}" IsReadOnly="True" Background="#1C1C1F" Foreground="#D6D6D6" BorderBrush="#1C1C1F" Margin="0"/>
     </Grid>
   </DockPanel>
 </Window>
 '@
 
 $script:Window = [System.Windows.Markup.XamlReader]::Parse($xaml)
+# The installer ships PsadtPackager.ico next to the script; use it for the window and taskbar when it is there.
+$windowIcon = Join-Path $PSScriptRoot 'PsadtPackager.ico'
+if (Test-Path -LiteralPath $windowIcon) { try { $script:Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]$windowIcon) } catch { } }
+if (-not $script:Window.Icon)
+{
+    # Run straight from the script (no .ico next to it): draw the same mark the installer's icon uses.
+    try
+    {
+        $iconSize = 64
+        $visual = New-Object System.Windows.Media.DrawingVisual
+        $dc = $visual.RenderOpen()
+        $dc.DrawImage($script:Window.FindResource('AppIcon'), (New-Object System.Windows.Rect(0, 0, $iconSize, $iconSize)))
+        $dc.Close()
+        $bitmap = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($iconSize, $iconSize, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $bitmap.Render($visual)
+        $script:Window.Icon = $bitmap
+    }
+    catch { }
+}
 $script:ui = @{}
 foreach ($m in [regex]::Matches($xaml, 'Name="(\w+)"')) { $script:ui[$m.Groups[1].Value] = $script:Window.FindName($m.Groups[1].Value) }
 $script:CurrentDefinitionPath = $null
@@ -3141,9 +5387,35 @@ $script:LogSink = {
     $box = $script:ui.LogBox
     $box.AppendText($Line + "`r`n")
     $box.ScrollToEnd()
-    $script:ui.StatusText.Text = $Line.Substring(11)
+    # During an auto-package run the status bar shows the stage, not every log line.
+    if (-not $script:AutoPackageRunning) { $script:ui.StatusText.Text = $Line.Substring(11) }
     Invoke-UiRefresh
 }
+
+# Auto-package progress: an elapsed-time ticker (it ticks while long steps keep the window pumping) and the taskbar
+# button's progress, so a run is visibly alive even with the window minimised.
+$script:AutoPackageRunning = $false
+$script:AutoPackageStarted = $null
+$script:AutoPackageStep    = ''
+$script:ElapsedTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:ElapsedTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:ElapsedTimer.Add_Tick({
+    if (-not $script:AutoPackageStarted) { return }
+    $e = (Get-Date) - $script:AutoPackageStarted
+    $script:ui.DropElapsed.Text = ('{0}:{1:00} elapsed{2}' -f [int][Math]::Floor($e.TotalMinutes), $e.Seconds, $(if ($script:AutoPackageStep) { "  -  $($script:AutoPackageStep)" } else { '' }))
+})
+$script:Window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+
+# An unexpected error in an event handler is logged instead of closing the window (and losing the work on it).
+$script:Window.Dispatcher.Add_UnhandledException({
+    param($dispatcherSource, $e)
+    try { Write-PackagerLog "Unexpected error: $($e.Exception.Message)" -Level Error } catch { }
+    $e.Handled = $true
+})
+$script:Window.Add_Activated({
+    # The finished state stays on the taskbar button until the window is looked at.
+    if (-not $script:AutoPackageRunning) { $script:Window.TaskbarItemInfo.ProgressState = 'None' }
+})
 
 function Show-Message
 {
@@ -3278,6 +5550,7 @@ function Get-UiDefinition
     $d.Uninstall.ApplicationType = Get-ComboCode $u.UninstallAppType $script:AppTypeCodes 'All'
     $d.Uninstall.File            = $u.UninstallFile.Text.Trim()
     $d.Uninstall.Arguments       = $u.UninstallArgs.Text.Trim()
+    $d.Uninstall.SuccessExitCodes = @(Split-ListText $u.UninstallSuccessCodes.Text | Where-Object { $_ -match '^-?\d+$' } | ForEach-Object { [int]$_ })
     $d.Uninstall.PackageName     = $u.UninstallPackageName.Text.Trim()
     $d.Uninstall.PreScript       = $u.UninstallPre.Text
     $d.Uninstall.CustomScript    = $u.UninstallCustom.Text
@@ -3359,6 +5632,7 @@ function Set-UiDefinition
     Set-ComboCode $u.UninstallAppType $script:AppTypeCodes $d.Uninstall.ApplicationType
     $u.UninstallFile.Text         = "$($d.Uninstall.File)"
     $u.UninstallArgs.Text         = "$($d.Uninstall.Arguments)"
+    $u.UninstallSuccessCodes.Text = (@($d.Uninstall.SuccessExitCodes) -join ', ')
     $u.UninstallPackageName.Text  = "$($d.Uninstall.PackageName)"
     $u.UninstallPre.Text          = "$($d.Uninstall.PreScript)"
     $u.UninstallCustom.Text       = "$($d.Uninstall.CustomScript)"
@@ -3409,7 +5683,7 @@ function Update-FieldStates
     $u.BtnInstallAutoFill.IsEnabled = $it -ne 'Custom'
     $u.InstallArgs.IsEnabled        = $it -ne 'Custom'
     $u.InstallPreset.IsEnabled      = $it -eq 'EXE'
-    $u.BtnProbeSandbox.IsEnabled    = $it -eq 'EXE'
+    $u.BtnProbeSandbox.IsEnabled    = $it -in @('EXE', 'Script') -and -not $script:AutoPackageRunning
     $u.InstallTransforms.IsEnabled  = $it -eq 'MSI'
     $u.InstallProductCode.IsEnabled = $it -eq 'MSI'
     $u.InstallCustom.IsEnabled      = $it -eq 'Custom'
@@ -3477,6 +5751,159 @@ function Import-InstallerIntoUi
     {
         Write-PackagerLog "Could not read installer: $($_.Exception.Message)" -Level Error
         Show-Message -Text $_.Exception.Message -Title 'Read installer' -Icon Error
+    }
+}
+
+function Set-DropZone
+{
+    # The drop card on the Application tab doubles as the progress and result panel of an auto-package run.
+    param([string]$Title, [string]$Detail, [ValidateSet('Idle', 'Busy', 'Validated', 'Built', 'NeedsAttention', 'Failed')][string]$State = 'Idle')
+    $u = $script:ui
+    if ($PSBoundParameters.ContainsKey('Title'))  { $u.DropTitle.Text = $Title }
+    if ($PSBoundParameters.ContainsKey('Detail')) { $u.DropDetail.Text = $Detail }
+    $colour = switch ($State) { 'Validated' { '#0E7A0D' } 'NeedsAttention' { '#9A5B00' } 'Failed' { '#C42B1C' } default { '#1B1B1B' } }
+    $u.DropTitle.Foreground = (New-Object System.Windows.Media.BrushConverter).ConvertFromString($colour)
+    $busy = $State -eq 'Busy'
+    foreach ($e in @($u.DropProgress, $u.StatusProgress, $u.DropElapsed)) { $e.Visibility = $(if ($busy) { 'Visible' } else { 'Collapsed' }) }
+    # Assigned directly: $( ) around it would unroll the DoubleCollection into an object[] the property rejects.
+    if ($State -eq 'Idle' -or $busy) { $u.DropZoneRect.StrokeDashArray = [System.Windows.Media.DoubleCollection]::Parse('5 4') }
+    else { $u.DropZoneRect.StrokeDashArray = $null }
+    $edge = switch ($State) { 'Validated' { '#6CB76C' } 'NeedsAttention' { '#E0A040' } 'Failed' { '#E07060' } default { '#B9B9B9' } }
+    $u.DropZoneRect.Stroke = (New-Object System.Windows.Media.BrushConverter).ConvertFromString($edge)
+}
+
+function Set-AutoPackageBusy
+{
+    # Locks the actions that would collide with a run, and starts / stops the progress indicators.
+    param([bool]$Busy)
+    $u = $script:ui
+    $script:AutoPackageRunning = $Busy
+    foreach ($c in @($u.BtnAutoPackage, $u.BtnImportInstaller, $u.BtnGenerate, $u.BtnIntunePublish, $u.MenuNew, $u.MenuOpen, $u.BtnInstallAutoFill)) { $c.IsEnabled = -not $Busy }
+    if ($Busy)
+    {
+        $u.BtnProbeSandbox.IsEnabled = $false
+        $u.BtnOpenReport.Visibility  = 'Collapsed'
+        $script:AutoPackageStarted = Get-Date
+        $script:AutoPackageStep = ''
+        $u.DropElapsed.Text = '0:00 elapsed'
+        $script:ElapsedTimer.Start()
+        $script:Window.TaskbarItemInfo.ProgressState = 'Indeterminate'
+        $script:Window.Cursor = [System.Windows.Input.Cursors]::AppStarting
+    }
+    else
+    {
+        $script:ElapsedTimer.Stop()
+        $script:AutoPackageStarted = $null
+        $script:Window.Cursor = $null
+        Update-FieldStates
+    }
+}
+
+function Show-DefinitionInUi
+{
+    # Loads a definition into the tabs. For EXE installers it also selects the engine preset, then puts back the
+    # arguments that were worked out (selecting a preset rewrites the argument boxes).
+    param([Parameter(Mandatory)]$Def, [string]$Engine)
+    Set-UiDefinition -d $Def
+    if ($Def.Install.Type -eq 'EXE' -and $Engine)
+    {
+        $keys = @($script:SilentPresets.Keys)
+        $idx = [Array]::IndexOf($keys, $Engine); if ($idx -lt 0) { $idx = [Array]::IndexOf($keys, 'Unknown') }
+        $script:ui.InstallPreset.SelectedIndex = $idx
+        $script:ui.InstallArgs.Text   = "$($Def.Install.Arguments)"
+        $script:ui.UninstallArgs.Text = "$($Def.Uninstall.Arguments)"
+    }
+}
+
+function Start-AutoPackageFromUi
+{
+    # GUI wrapper for Invoke-AutoPackage. The tabs fill in as soon as the file has been read and again as the sandbox
+    # learns more; the drop card shows the current step, an elapsed timer and finally the result.
+    param([Parameter(Mandatory)][string]$Path)
+    if ($script:AutoPackageRunning) { Write-PackagerLog 'An auto-package run is already in progress.' -Level Warn; return }
+    $sandbox = $false
+    if (-not $NoSandbox) { $sandbox = [bool](Test-WindowsSandbox) }
+    $leaf = Split-Path -Path $Path -Leaf
+    $base = Get-UiDefinition
+
+    $script:ui.Tabs.SelectedIndex = 0
+    Set-AutoPackageBusy $true
+    Set-DropZone -Title "Packaging $leaf" -Detail 'Reading the file...' -State Busy
+    $script:ui.StatusText.Text = "Auto-packaging $leaf"
+    $onProgress = {
+        param($Stage, $Message, $Definition, $Info)
+        $script:AutoPackageStep = $(switch ($Stage) { 'Reading' { 'reading' } 'Read' { 'read' } 'Probing' { 'Windows Sandbox' } 'Probed' { 'worked out' } 'Building' { 'building' } 'Validating' { 'end-to-end test' } default { '' } })
+        if ($script:AutoPackageStarted)
+        {
+            $e = (Get-Date) - $script:AutoPackageStarted
+            $script:ui.DropElapsed.Text = ('{0}:{1:00} elapsed  -  {2}' -f [int][Math]::Floor($e.TotalMinutes), $e.Seconds, $script:AutoPackageStep)
+        }
+        Set-DropZone -Detail $Message -State Busy
+        $script:ui.StatusText.Text = $Message
+        if ($Definition)
+        {
+            $engine = ''
+            if ($Info) { $engine = "$($Info.Engine)" }
+            Show-DefinitionInUi -Def $Definition -Engine $engine
+            $script:ui.BtnProbeSandbox.IsEnabled = $false
+        }
+        Invoke-UiRefresh
+    }
+    try
+    {
+        $confirm = { param($root) Confirm-Action -Text "A package already exists at`n$root`n`nRebuild it?" -Title 'Auto-package' }
+        $ctx = Invoke-AutoPackage -Path $Path -BaseDefinition $base -NoSandbox:(-not $sandbox) -SkipValidation:$SkipValidation -Force:([bool]$script:ui.OutOverwrite.IsChecked) -ConfirmOverwrite $confirm -OnProgress $onProgress
+        $def = $ctx.Definition
+        $engine = ''
+        if ($ctx.Info) { $engine = "$($ctx.Info.Engine)" }
+        Show-DefinitionInUi -Def $def -Engine $engine
+        $script:CurrentDefinitionPath = $null
+        $script:Window.Title = 'PSADT Packager'
+        if ($ctx.PackageRoot)
+        {
+            $script:LastOutputPath = $ctx.PackageRoot
+            $script:CurrentDefinitionPath = Join-Path $ctx.PackageRoot 'Package.json'
+            $script:Window.Title = "PSADT Packager - $(Split-Path -Path $ctx.PackageRoot -Leaf)"
+        }
+        foreach ($w in @($ctx.Warnings)) { Write-PackagerLog $w -Level Warn }
+        $label = "$("$($def.App.Name) $($def.App.Version)".Trim())"
+        $warnings = ''
+        if (@($ctx.Warnings).Count -gt 0) { $warnings = "`n`n- " + (@($ctx.Warnings) -join "`n- ") }
+        switch ($ctx.Status)
+        {
+            'Validated'
+            {
+                Set-DropZone -Title "Validated: $label" -State Validated -Detail ("Installed, detected, uninstalled and confirmed gone in Windows Sandbox as SYSTEM, the way Intune runs it. The package is in $($ctx.PackageRoot); every tab shows what was worked out." + $warnings)
+                $script:Window.TaskbarItemInfo.ProgressState = 'Normal'
+            }
+            'Built'
+            {
+                Set-DropZone -Title "Built: $label" -State Built -Detail ("The package is in $($ctx.PackageRoot), but it was not tested end to end: $("$($ctx.ValidationNote)".TrimEnd('.'))." + $warnings)
+                $script:Window.TaskbarItemInfo.ProgressState = 'Normal'
+            }
+            default
+            {
+                Set-DropZone -Title "Needs attention: $(if ($label) { $label } else { $leaf })" -State NeedsAttention -Detail ("Check these before deploying; the tabs show what was worked out so far." + $warnings)
+                $script:Window.TaskbarItemInfo.ProgressState = 'Paused'
+            }
+        }
+        $script:Window.TaskbarItemInfo.ProgressValue = 1
+        $script:LastReportPath = $ctx.ReportPath
+        if ($ctx.ReportPath) { $script:ui.BtnOpenReport.Visibility = 'Visible' }
+        $script:ui.StatusText.Text = "Auto-package: $($ctx.Status) - $leaf"
+        if (-not $script:Window.IsActive) { $script:Window.Activate() | Out-Null }
+    }
+    catch
+    {
+        Write-PackagerLog "Auto-package failed: $($_.Exception.Message)" -Level Error
+        Set-DropZone -Title "Auto-package failed: $leaf" -Detail $_.Exception.Message -State Failed
+        $script:ui.StatusText.Text = 'Auto-package failed'
+        $script:Window.TaskbarItemInfo.ProgressState = 'Error'
+        $script:Window.TaskbarItemInfo.ProgressValue = 1
+    }
+    finally
+    {
+        Set-AutoPackageBusy $false
     }
 }
 
@@ -3617,9 +6044,53 @@ $script:ui.MenuAbout.Add_Click({
 })
 
 $script:ui.BtnImportInstaller.Add_Click({
-    $p = Select-FileDialog -Title 'Select the installer' -Filter 'Installers (*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1)|*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1|All files (*.*)|*.*'
+    $p = Select-FileDialog -Title 'Select the installer' -Filter 'Installers and scripts (*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs)|*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs|All files (*.*)|*.*'
     if ($p.Count -gt 0) { Import-InstallerIntoUi -Path $p[0] }
 })
+$script:ui.BtnOpenReport.Add_Click({
+    if ($script:LastReportPath -and (Test-Path -LiteralPath $script:LastReportPath)) { Start-Process -FilePath $script:LastReportPath }
+})
+$script:ui.BtnAutoPackage.Add_Click({
+    $p = Select-FileDialog -Title 'Auto-package: pick an installer, script or .zip (drag folders onto the window)' -Filter 'Installers, scripts and archives (*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs;*.zip)|*.msi;*.exe;*.msix;*.appx;*.msixbundle;*.appxbundle;*.ps1;*.cmd;*.bat;*.vbs;*.zip|All files (*.*)|*.*'
+    if ($p.Count -gt 0) { Start-AutoPackageFromUi -Path $p[0] }
+})
+
+# Drop anything on the window. Preview events, so text boxes don't take the file as text; the run starts once the drop
+# has completed, so Explorer is not left waiting on it.
+$script:Window.Add_PreviewDragOver({
+    param($dragSource, $e)
+    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop) -and -not $script:AutoPackageRunning)
+    {
+        $e.Effects = [System.Windows.DragDropEffects]::Copy
+        # Light up the drop card while something is being dragged over the window (its own edge comes back after).
+        if (-not $script:DropEdge) { $script:DropEdge = $script:ui.DropZoneRect.Stroke }
+        $script:ui.DropZoneRect.Stroke = $script:Window.FindResource('Focus')
+        $script:ui.DropZoneRect.Fill   = (New-Object System.Windows.Media.BrushConverter).ConvertFromString('#F4F7FC')
+    }
+    else { $e.Effects = [System.Windows.DragDropEffects]::None }
+    $e.Handled = $true
+})
+$script:Window.Add_PreviewDragLeave({
+    $script:ui.DropZoneRect.Fill = [System.Windows.Media.Brushes]::White
+    if ($script:DropEdge) { $script:ui.DropZoneRect.Stroke = $script:DropEdge; $script:DropEdge = $null }
+})
+$script:Window.Add_PreviewDrop({
+    param($dragSource, $e)
+    $script:ui.DropZoneRect.Fill = [System.Windows.Media.Brushes]::White
+    if ($script:DropEdge) { $script:ui.DropZoneRect.Stroke = $script:DropEdge; $script:DropEdge = $null }
+    if (-not $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { return }
+    $e.Handled = $true
+    $dropped = @($e.Data.GetData([System.Windows.DataFormats]::FileDrop))
+    if ($dropped.Count -eq 0) { return }
+    if ($dropped.Count -gt 1) { Write-PackagerLog "Several items dropped; packaging the first: $($dropped[0])" -Level Warn }
+    $script:PendingDrop = "$($dropped[0])"
+    [void]$script:Window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
+        $p = $script:PendingDrop
+        $script:PendingDrop = $null
+        if ($p) { Start-AutoPackageFromUi -Path $p }
+    })
+})
+
 $script:ui.BtnInstallAutoFill.Add_Click({
     $name = "$($script:ui.InstallFile.Text)".Trim()
     if (-not $name) { Show-Message -Text 'Select an installer file first.' -Icon Warning; return }
@@ -3664,34 +6135,45 @@ $script:ui.InstallPreset.Add_SelectionChanged({
 
 $script:ui.BtnProbeSandbox.Add_Click({
     $def = Get-UiDefinition
-    if ($def.Install.Type -ne 'EXE') { Show-Message -Text 'The sandbox probe is for EXE installers.' -Icon Information; return }
+    if ($def.Install.Type -notin @('EXE', 'Script')) { Show-Message -Text 'The sandbox probe is for EXE installers and scripts.' -Icon Information; return }
     $name = "$($def.Install.File)".Trim()
     if (-not $name) { Show-Message -Text 'Select the installer file first (Source files tab, then Install tab).' -Icon Warning; return }
-    $installer = $null
+    # Where the file comes from decides what the sandbox gets: a folder source ships whole, a single file ships alone.
+    $installer = $null; $sourceRoot = $null; $whole = $false
     foreach ($src in @($def.Sources.Files))
     {
         $s = "$src"
-        if ($s.EndsWith('\*')) { $c = Join-Path $s.Substring(0, $s.Length - 2) $name; if (Test-Path -LiteralPath $c -PathType Leaf) { $installer = $c; break } }
-        elseif (Test-Path -LiteralPath $s -PathType Container) { $c = Join-Path (Split-Path -Path $s -Parent) $name; if (Test-Path -LiteralPath $c -PathType Leaf) { $installer = $c; break } }
-        elseif ((Split-Path -Path $s -Leaf) -ieq (Split-Path -Path $name -Leaf) -and (Test-Path -LiteralPath $s -PathType Leaf)) { $installer = $s; break }
+        if ($s.EndsWith('\*')) { $dir = $s.Substring(0, $s.Length - 2); $c = Join-Path $dir $name; if (Test-Path -LiteralPath $c -PathType Leaf) { $installer = $c; $sourceRoot = $dir; $whole = $true; break } }
+        elseif (Test-Path -LiteralPath $s -PathType Container) { $c = Join-Path (Split-Path -Path $s -Parent) $name; if (Test-Path -LiteralPath $c -PathType Leaf) { $installer = $c; $sourceRoot = Split-Path -Path $s -Parent; $whole = $true; break } }
+        elseif ((Split-Path -Path $s -Leaf) -ieq (Split-Path -Path $name -Leaf) -and (Test-Path -LiteralPath $s -PathType Leaf)) { $installer = $s; $sourceRoot = Split-Path -Path $s -Parent; break }
     }
     if (-not $installer) { Show-Message -Text "Could not find '$name' among the source files." -Icon Warning; return }
     if (-not (Test-WindowsSandbox))
     {
-        Show-Message -Text "Windows Sandbox is not available on this PC.`n`nEnable it (Windows Features > Windows Sandbox, or Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM) and try again." -Title 'Find switches' -Icon Warning
+        Show-Message -Text "Windows Sandbox (with its wsb command-line tool) is not available on this PC.`n`nEnable Windows Sandbox in Windows Features (Windows 11 24H2 or later, or update it from the Microsoft Store) and try again." -Title 'Find switches' -Icon Warning
         return
     }
 
-    $engine = 'Unknown'
-    try { $engine = Get-InstallerEngine -Path $installer } catch { }
-    $candidates = @(Get-SilentCandidates -Path $installer -Engine $engine -CurrentArgs $def.Install.Arguments -Max 4)
-    $preset = $script:SilentPresets[$engine]
-    $uninstallArgs = if ($preset) { $preset.Uninstall } else { '' }
-    $msg = "Installer: $installer`nEngine: $engine`n`nEach candidate boots a fresh Windows Sandbox (about 1-3 minutes each), runs the installer with those switches, checks what got registered, runs your detection script and tests the uninstall.`n`nCandidates, in order:`n  " + ($candidates -join "`n  ") + "`n`nA sandbox window will open on screen - leave it alone. Continue?"
+    $engine = 'Script'
+    $uninstallArgs = ''
+    if ($def.Install.Type -eq 'EXE')
+    {
+        $engine = 'Unknown'
+        try { $engine = Get-InstallerEngine -Path $installer } catch { }
+        $candidates = @(Get-SilentCandidates -Path $installer -Engine $engine -CurrentArgs $def.Install.Arguments -Max 4)
+        $preset = $script:SilentPresets[$engine]
+        if ($preset) { $uninstallArgs = $preset.Uninstall }
+        $msg = "Installer: $installer`nEngine: $engine`n`nEach candidate runs in a fresh Windows Sandbox as SYSTEM (like Intune; about 1-3 minutes each, no window opens): the installer with those switches, what it registers and creates, your detection script, and the uninstall.`n`nCandidates, in order:`n  " + ($candidates -join "`n  ") + "`n`nContinue?"
+    }
+    else
+    {
+        $candidates = @("$($def.Install.Arguments)")
+        $msg = "Script: $installer`n`nRuns it once in a fresh Windows Sandbox as SYSTEM (like Intune; no window opens) and records what it creates, so detection and uninstall can be derived from that.`n`nContinue?"
+    }
     if (-not (Confirm-Action -Text $msg -Title 'Find switches in Sandbox')) { return }
 
     $detection = $null
-    try { $detection = New-DetectionScript -Def $def } catch { }
+    if ($def.Detection.Type -ne 'Script' -or "$($def.Detection.Script)".Trim()) { try { $detection = New-DetectionScript -Def $def } catch { } }
     $success = @($def.Install.SuccessExitCodes | Where-Object { "$_" -match '^-?\d+$' } | ForEach-Object { [int]$_ }) + @($def.Install.RebootExitCodes | Where-Object { "$_" -match '^-?\d+$' } | ForEach-Object { [int]$_ })
     if ($success.Count -eq 0) { $success = @(0, 3010, 1641) }
 
@@ -3699,7 +6181,7 @@ $script:ui.BtnProbeSandbox.Add_Click({
     $script:Window.Cursor = [System.Windows.Input.Cursors]::AppStarting
     try
     {
-        $results = @(Invoke-SandboxProbe -InstallerPath $installer -Candidates $candidates -DetectionScript $detection -UninstallArgs $uninstallArgs -SuccessCodes $success)
+        $results = @(Invoke-SandboxProbe -InstallerPath $installer -SourceRoot $sourceRoot -CopyWholeSource:$whole -Candidates $candidates -DetectionScript $detection -UninstallArgs $uninstallArgs -AppNameHint $def.App.Name -SuccessCodes $success -HelpSwitch $(if ($def.Install.Type -eq 'EXE') { '/?' } else { '' }))
         $summary = Get-ProbeSummary -Results $results
         foreach ($line in ($summary -split "`n")) { Write-PackagerLog $line }
         $win = @($results | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
@@ -3953,7 +6435,17 @@ $script:Window.Add_Closing({ Save-PackagerSettings })
 Set-UiDefinition -d (New-PackageDefinition)
 Read-PackagerSettings
 if ($Definition) { Open-DefinitionIntoUi -Path (Resolve-Path -LiteralPath $Definition).Path }
-Write-PackagerLog "PSADT Packager $script:PackagerVersion ready (PowerShell $($PSVersionTable.PSVersion))."
+if ($InstallerPath)
+{
+    # Started with -InstallerPath: auto-package as soon as the window is up.
+    $script:StartupInstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
+    $script:Window.Add_ContentRendered({
+        $p = $script:StartupInstallerPath
+        $script:StartupInstallerPath = $null
+        if ($p) { Start-AutoPackageFromUi -Path $p }
+    })
+}
+Write-PackagerLog "PSADT Packager $script:PackagerVersion ready (PowerShell $($PSVersionTable.PSVersion)). Drop an installer, script, .zip or folder on this window to auto-package it."
 $script:Window.ShowDialog() | Out-Null
 
 #endregion

@@ -1,0 +1,14 @@
+<!--
+  WiX 5.0.2, not 7: WiX 7 needs its Open Source Maintenance Fee EULA accepted before it builds, which is the
+  owner's decision to make. 5.0.2 is MS-RL licensed with no such step. Build with Build-Installer.ps1.
+-->
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <OutputName>PSADT-Packager</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+    <DefineConstants>Version=$(Version);PayloadDir=$(PayloadDir);IconPath=$(IconPath)</DefineConstants>
+    <!-- No ICE validation run: it needs the Windows SDK's msi tools; Build-Installer.ps1 checks the result instead. -->
+    <SuppressValidation>true</SuppressValidation>
+  </PropertyGroup>
+</Project>
