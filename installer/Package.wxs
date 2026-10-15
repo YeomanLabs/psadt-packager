@@ -1,0 +1,48 @@
+<!--
+  PSADT Packager MSI: per machine, into Program Files\PSADT Packager, with a Start menu shortcut.
+  Built by Build-Installer.ps1. Silent install for Intune or scripts:
+    msiexec /i PSADT-Packager-<version>-x64.msi /qn
+  Upgrades in place (same UpgradeCode); uninstall leaves each user's %LOCALAPPDATA%\PsadtPackager
+  (settings, toolkit cache, sandbox run folders).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="PSADT Packager"
+    Manufacturer="YeomanLabs"
+    Version="$(Version)"
+    UpgradeCode="19D97EAD-D5E2-469F-A48E-6FE23B60FC00"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of PSADT Packager is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="PsadtPackager.ico" SourceFile="$(IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="PsadtPackager.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/YeomanLabs/psadt-packager" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/YeomanLabs/psadt-packager" />
+    <!-- Nothing to choose or repair: install and uninstall only. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="PSADT Packager">
+        <!-- The launcher, PsadtPackager.ps1, its icon, README and example definitions. -->
+        <Files Include="$(PayloadDir)**" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut
+          Id="PackagerShortcut"
+          Name="PSADT Packager"
+          Description="Package any installer for Intune with PSAppDeployToolkit - drop it on the window"
+          Target="[INSTALLFOLDER]PSADT Packager.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="PsadtPackager.ico" />
+        <RegistryValue Root="HKLM" Key="Software\YeomanLabs\PSADT Packager" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Package>
+</Wix>

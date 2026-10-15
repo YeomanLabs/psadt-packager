@@ -3538,7 +3538,7 @@ function Invoke-AutoPackage
 
     # 4. Prove the package itself.
     if ($SkipValidation) { $context.ValidationNote = 'Skipped on request.' }
-    elseif (-not $sandbox) { $context.ValidationNote = 'Windows Sandbox is not available.' }
+    elseif (-not $sandbox) { $context.ValidationNote = $(if ($NoSandbox) { 'Sandbox runs were turned off (-NoSandbox).' } else { 'Windows Sandbox is not available.' }) }
     elseif ($in.Kind -in @('EXE', 'Script') -and -not $win) { $context.ValidationNote = 'Skipped: no silent install was found, so the package would only hang.' }
     else
     {
@@ -4700,6 +4700,9 @@ $xaml = @'
 '@
 
 $script:Window = [System.Windows.Markup.XamlReader]::Parse($xaml)
+# The installer ships PsadtPackager.ico next to the script; use it for the window and taskbar when it is there.
+$windowIcon = Join-Path $PSScriptRoot 'PsadtPackager.ico'
+if (Test-Path -LiteralPath $windowIcon) { try { $script:Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]$windowIcon) } catch { } }
 $script:ui = @{}
 foreach ($m in [regex]::Matches($xaml, 'Name="(\w+)"')) { $script:ui[$m.Groups[1].Value] = $script:Window.FindName($m.Groups[1].Value) }
 $script:CurrentDefinitionPath = $null
@@ -5108,7 +5111,7 @@ function Start-AutoPackageFromUi
         $head = switch ($ctx.Status)
         {
             'Validated' { "Done and validated: installed, detected, uninstalled and confirmed gone in Windows Sandbox as SYSTEM." }
-            'Built'     { "Package built, but not tested end to end ($($ctx.ValidationNote))." }
+            'Built'     { "Package built, but not tested end to end: $("$($ctx.ValidationNote)".TrimEnd('.'))." }
             default     { 'Needs attention before you deploy it.' }
         }
         $body = $head

@@ -18,6 +18,19 @@ A standard packager for Intune and ConfigMgr built on [PSAppDeployToolkit v4](ht
 
 Everything is one file, `PsadtPackager.ps1`. No install, no build step. Runs on Windows PowerShell 5.1 and PowerShell 7.
 
+## Install
+
+Run `PSADT-Packager-<version>-x64.msi` (or `msiexec /i PSADT-Packager-<version>-x64.msi /qn`). It installs per machine
+to `C:\Program Files\PSADT Packager` with a Start menu entry. *PSADT Packager.exe* is a small launcher that opens the
+GUI in Windows PowerShell 5.1 without a console window; drop an installer, script, zip or folder on it (or on a
+shortcut to it) to auto-package it straight away. Upgrades install over the top; uninstalling leaves each user's
+`%LOCALAPPDATA%\PsadtPackager` (settings, toolkit cache, sandbox runs).
+
+For scripting and CI, call `PsadtPackager.ps1` in the install folder directly; the launcher doesn't wait or show output.
+
+Build the MSI yourself with `.\installer\Build-Installer.ps1` (needs the .NET SDK; WiX 5.0.2 comes from NuGet). It writes
+`dist\PSADT-Packager-<version>-x64.msi`. The MSI and launcher are not code-signed, so SmartScreen may warn on first run.
+
 ## Run
 
 ```powershell
@@ -174,6 +187,7 @@ Use `-DeployMode Auto` (or omit it) for Available assignments where you want the
 | --- | --- |
 | `PsadtPackager.ps1` | GUI, definition model, code generators, sandbox probe, auto-package, headless build |
 | `examples\` | Sample definitions (edit the `Sources.Files` paths to match your share) |
+| `installer\` | MSI build: `Build-Installer.ps1`, the launcher (`Launcher.cs`) and the WiX package (`Package.wxs`) |
 | `tests\Test-PsadtPackager.ps1` | Offline regression tests (no sandbox or network): name/version clean-up, input classification, probe decisions, and that every generated script parses. Run it under both PowerShell 5.1 and 7. |
 
 ## Notes
