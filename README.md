@@ -86,7 +86,7 @@ Limits worth knowing:
 * **Installers that need a licence key, a server name or a reboot mid-way** cannot be guessed. The probe reports which switches it tried and the installer's own `/?` help text so you can finish it on the Install tab.
 * **Generated uninstalls** (scripts and installers that register no uninstaller) remove exactly what the sandbox saw being created. Review them before production use; the end-to-end test proves they run cleanly, not that nothing else needed removing.
 * **VBScript installers (`.vbs`) cannot be observed** on current Windows: VBScript is an optional component Microsoft is retiring, and the Windows Sandbox image does not include it (nor can it be added there). The report says so; set detection and uninstall by hand, or better, convert the script to PowerShell before VBScript disappears from your devices too.
-* **Every MSI install inside Windows Sandbox pauses for about two minutes** at the Windows Installer's software-restriction check (measured: 7-Zip's MSI takes ~121 s there, every time, with or without networking). It is a sandbox quirk, not the package, but it makes MSI-based apps slower to test: a WiX bundle with two MSIs takes ~4 minutes per run. The stuck rules allow for it.
+* **Smart App Control is switched off inside the sandbox.** Windows Sandbox starts with Smart App Control in evaluation mode but Microsoft Defender's engine disabled, so every MSI install asked Defender about the package, got no answer and retried for 120 seconds (traced with ETW: msiexec, WLDP, MpClient, Defender's RPC endpoint missing). With it off, an MSI installs in seconds. Real devices either run Defender, which answers at once, or have Smart App Control off, as managed devices do.
 
 ## Workflow
 
@@ -119,14 +119,15 @@ Silent-switch presets are provided for Inno Setup, NSIS, InstallShield, WiX Burn
 
 Signature detection is a guess. *Find switches in Sandbox...* on the Install tab (and auto-package) proves it:
 for each candidate switch set it starts a fresh Windows Sandbox (headless where `wsb.exe` exists, see below), copies the installer in
-and runs it **as SYSTEM**, the account Intune uses. It runs `setup.exe /?` first and captures the help dialog's text
-or console output, then runs the candidate while watching the whole process tree. SYSTEM has no visible desktop,
+and runs it **as SYSTEM**, the account Intune uses, watching the whole process tree. If a candidate fails, it also
+runs `setup.exe /?` and captures the help dialog's text or console output for the report. SYSTEM has no visible desktop,
 so an installer waiting for a click just sits there: a run counts as stuck when the tree (plus anything it started,
 such as the Windows Installer service) goes idle for 30 seconds while it shows a window with controls, or stays idle
-for five minutes without one. Windows that don't wait for anyone don't count: quiet-mode windows that are created but
+for two minutes without one. Windows that don't wait for anyone don't count: quiet-mode windows that are created but
 never shown, and progress windows (a visible progress bar, as `/passive` installs and redistributables chained by a
-bundle show). While Windows Installer is running, a window gets 150 seconds instead of 30, because every MSI install
-sits still for about two minutes in the sandbox. The report quotes only the text the window actually shows. It snapshots
+bundle show). The report quotes only the text the window actually shows. Every 30 seconds the log says what is
+running, whether it is busy, and how many files the install has written so far (and the newest one), so a run that
+is not moving is plain to see. It snapshots
 the system before and after, so a successful run reports the real uninstall entry (`DisplayName`,
 `DisplayVersion`, `Publisher`, `UninstallString`/`QuietUninstallString`) and everything else the install created,
 runs your detection script, then runs the uninstall and confirms the entry is gone and detection is negative.
