@@ -7,7 +7,7 @@
     2. Draws the icon (installer\obj\PsadtPackager.ico).
     3. Compiles the launcher (Launcher.cs -> "PSADT Packager.exe") with the .NET Framework C# compiler that ships
        with Windows.
-    4. Stages the launcher, PsadtPackager.ps1, the icon, README.md and examples\ as the payload.
+    4. Stages the launcher, PsadtPackager.ps1, the icon, README.md, LICENSE and examples\ as the payload.
     5. Builds Package.wxs with WiX 5.0.2 (dotnet build; the SDK comes from NuGet) and copies the MSI to dist\.
 
     Needs the .NET SDK (any version that can restore WixToolset.Sdk 5.0.2). The MSI is not code-signed.
@@ -131,6 +131,7 @@ Write-Host "Launcher: $exe"
 # ---- Payload
 Copy-Item -LiteralPath $scriptPath -Destination $payload
 Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination $payload
+Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $payload
 Copy-Item -LiteralPath $icon -Destination $payload
 Copy-Item -LiteralPath (Join-Path $repo 'examples') -Destination $payload -Recurse
 
