@@ -118,7 +118,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUN
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.1.2'
+$script:PackagerVersion = '1.1.3'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -2546,7 +2546,7 @@ function Test-WindowsSandbox
     {
         if ($script:SandboxMode -ne 'Classic')
         {
-            Write-PackagerLog 'This Windows Sandbox has no command-line tool (wsb.exe comes with the Microsoft Store update of Windows Sandbox), so each sandbox run opens a Windows Sandbox window. Leave it open: it runs on its own and closes itself when the run is done.'
+            Write-PackagerLog 'This Windows Sandbox has no command-line tool (wsb.exe comes with the Microsoft Store update of Windows Sandbox), so each sandbox run starts Windows Sandbox with its window hidden; it runs on its own and closes itself when the run is done.'
         }
         $script:SandboxMode = 'Classic'
         return 'Classic'
@@ -2708,6 +2708,48 @@ finally
 }
 '@
 
+function Hide-SandboxWindows
+{
+    # Hides every visible top-level window of the given processes (no taskbar button either). The Sandbox window only
+    # shows the sandbox's desktop; the run inside goes on as SYSTEM whether or not anyone can see it.
+    param([int[]]$ProcessIds)
+    if (-not $ProcessIds) { return 0 }
+    if (-not ('PsadtPackager.SandboxWindows' -as [type]))
+    {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+namespace PsadtPackager
+{
+    public static class SandboxWindows
+    {
+        private delegate bool EnumProc(IntPtr hwnd, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc callback, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int cmd);
+        public static int Hide(int[] processIds)
+        {
+            var ids = new HashSet<uint>();
+            foreach (int id in processIds) { ids.Add((uint)id); }
+            int hidden = 0;
+            EnumWindows(delegate (IntPtr hwnd, IntPtr lParam)
+            {
+                uint pid;
+                GetWindowThreadProcessId(hwnd, out pid);
+                if (ids.Contains(pid) && IsWindowVisible(hwnd)) { ShowWindow(hwnd, 0); hidden++; }
+                return true;
+            }, IntPtr.Zero);
+            return hidden;
+        }
+    }
+}
+'@
+    }
+    return [PsadtPackager.SandboxWindows]::Hide($ProcessIds)
+}
+
 function Invoke-ClassicSandboxRun
 {
     # For a Windows Sandbox without wsb.exe (the built-in one on Windows 11 24H2 until it is updated from the Microsoft
@@ -2722,10 +2764,32 @@ function Invoke-ClassicSandboxRun
         [scriptblock]$OnTick
     )
     $names = @('WindowsSandbox', 'WindowsSandboxClient', 'WindowsSandboxRemoteSession')
+    # running.txt notes "classic|owner process id" while a run is under way, so a hidden sandbox left behind by a packager
+    # that was closed mid-run can be told apart from one the user opened (or another packager window is using).
+    $ours = Join-Path $script:AppDataDir 'Sandbox\running.txt'
+    $classicLines = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ -like 'classic|*' })
     if (Get-Process -Name $names -ErrorAction SilentlyContinue)
     {
-        throw 'A Windows Sandbox window is already open. Only one sandbox can run at a time - close it and try again.'
+        $orphan = $false
+        foreach ($line in $classicLines)
+        {
+            $owner = 0
+            [void][int]::TryParse($line.Split('|')[1], [ref]$owner)
+            if ($owner -and $owner -ne $PID -and (Get-Process -Id $owner -ErrorAction SilentlyContinue))
+            {
+                throw 'Another PSADT Packager window is using Windows Sandbox right now, and only one sandbox can run at a time. Wait for it to finish and try again.'
+            }
+            $orphan = $true
+        }
+        if (-not $orphan) { throw 'Windows Sandbox is already open. Only one sandbox can run at a time - close it and try again.' }
+        Write-PackagerLog 'Closing a Windows Sandbox left over from an interrupted run.'
+        Get-Process -Name $names -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $pause = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($pause.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 250; Invoke-UiRefresh }
     }
+    $keep = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ -and $_ -notlike 'classic|*' })
+    New-Item -ItemType Directory -Path (Split-Path -Path $ours -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $ours -Value (@($keep) + "classic|$PID")
     $done = Join-Path $RunDir 'classic-done.txt'
     if (Test-Path -LiteralPath $done) { Remove-Item -LiteralPath $done -Force }
     Write-Utf8File -Path (Join-Path $RunDir 'Start-Classic.ps1') -Content $script:ClassicSandboxBootstrap
@@ -2743,11 +2807,16 @@ function Invoke-ClassicSandboxRun
 
     # Opening a sandbox right after another has closed sometimes fails ("Windows Sandbox failed to initialize"), and the
     # error window stays open. So: if the probe has not started within $startLimit, close everything and try once more.
+    # The window is hidden as soon as it appears (PSADT_PACKAGER_SANDBOX_WINDOW=Show keeps it), except on that second
+    # try, so whatever stopped the first one is on screen.
     for ($try = 1; $try -le 2; $try++)
     {
-        if ($try -eq 1) { Write-PackagerLog 'Opening a Windows Sandbox window for this run (it closes itself when the run is done).' }
-        else { Write-PackagerLog 'Windows Sandbox did not start the run; closing it and trying once more.' -Level Warn }
-        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe') -ArgumentList ('"' + $wsbFile + '"') | Out-Null
+        $hide = $try -eq 1 -and $env:PSADT_PACKAGER_SANDBOX_WINDOW -ne 'Show'
+        if ($try -eq 1 -and $hide) { Write-PackagerLog 'Starting Windows Sandbox for this run. Its window is kept hidden and closes itself when the run is done.' }
+        elseif ($try -eq 1) { Write-PackagerLog 'Opening a Windows Sandbox window for this run (it closes itself when the run is done).' }
+        else { Write-PackagerLog 'Windows Sandbox did not start the run; closing it and trying once more with its window shown.' -Level Warn }
+        $style = $(if ($hide) { 'Hidden' } else { 'Normal' })
+        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe') -ArgumentList ('"' + $wsbFile + '"') -WindowStyle $style | Out-Null
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $lastCheck = 0
@@ -2756,7 +2825,14 @@ function Invoke-ClassicSandboxRun
         $outcome = $null
         while (-not $state)
         {
-            for ($k = 0; $k -lt 4; $k++) { Start-Sleep -Milliseconds 250; Invoke-UiRefresh }
+            # Look for the window every 50 ms while the sandbox starts (it appears then), every 250 ms after that.
+            $step = $(if ($hide -and $sw.Elapsed.TotalSeconds -lt 90) { 50 } else { 250 })
+            for ($k = 0; $k -lt (1000 / $step); $k++)
+            {
+                Start-Sleep -Milliseconds $step
+                if ($hide) { [void](Hide-SandboxWindows -ProcessIds @(Get-Process -Name $names -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })) }
+                if ($k % 5 -eq 0) { Invoke-UiRefresh }
+            }
             if ($OnTick) { & $OnTick }
             $started = Test-Path -LiteralPath $logPath
             if (Test-Path -LiteralPath $done) { $outcome = "$(Get-Content -LiteralPath $done -Raw -ErrorAction SilentlyContinue)".Trim(); $state = 'Done' }
@@ -2776,7 +2852,15 @@ function Invoke-ClassicSandboxRun
 
         # After a finished run the sandbox shuts itself down; give it time, then close whatever is left.
         $wait = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($state -eq 'Done' -and (Get-Process -Name $names -ErrorAction SilentlyContinue) -and $wait.Elapsed.TotalSeconds -lt 120) { Start-Sleep -Milliseconds 500; Invoke-UiRefresh }
+        # Windows Sandbox shows a small status window while it shuts down; keep hiding until it has gone.
+        while ($state -eq 'Done' -and $wait.Elapsed.TotalSeconds -lt 120)
+        {
+            $ids = @(Get-Process -Name $names -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+            if ($ids.Count -eq 0) { break }
+            if ($hide) { [void](Hide-SandboxWindows -ProcessIds $ids) }
+            Start-Sleep -Milliseconds 50
+            if ([int]($wait.Elapsed.TotalMilliseconds / 50) % 5 -eq 0) { Invoke-UiRefresh }
+        }
         $left = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
         if ($left.Count -gt 0)
         {
@@ -2789,6 +2873,8 @@ function Invoke-ClassicSandboxRun
         if ($state -ne 'NoStart') { break }
         if ($try -eq 2) { Write-PackagerLog 'Windows Sandbox failed to start twice. Close any Windows Sandbox windows (or restart the PC) and try again.' -Level Warn }
     }
+    $keep = @(Get-Content -LiteralPath $ours -ErrorAction SilentlyContinue | Where-Object { $_ -and $_ -notlike 'classic|*' })
+    Set-Content -LiteralPath $ours -Value $keep
 }
 
 function Invoke-SandboxRun
