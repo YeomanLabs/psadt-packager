@@ -118,7 +118,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUN
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.1.1'
+$script:PackagerVersion = '1.1.2'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -1602,6 +1602,22 @@ function Import-PsadtModule
         $mod = Get-Module -ListAvailable -Name PSAppDeployToolkit | Sort-Object Version -Descending | Select-Object -First 1
         if (-not $mod) { throw 'PSAppDeployToolkit was downloaded but could not be located afterwards.' }
     }
+    # Install-Module puts the toolkit in Documents, which OneDrive often syncs and may keep online-only, so every build
+    # (the template copies the whole module) would wait for OneDrive. Build from a local copy in the cache instead.
+    $inCache = { param($m) $m.ModuleBase.StartsWith($script:ModuleCache.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase) }
+    $oneDrive = @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' })
+    if (-not (& $inCache $mod) -and @($oneDrive | Where-Object { $mod.ModuleBase.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+    {
+        $target = Join-Path $script:ModuleCache "PSAppDeployToolkit\$($mod.Version)"
+        if (-not (Test-Path -LiteralPath (Join-Path $target 'PSAppDeployToolkit.psd1')))
+        {
+            Write-PackagerLog "Copying PSAppDeployToolkit $($mod.Version) from OneDrive ($($mod.ModuleBase)) to $target, once, so builds don't wait for OneDrive"
+            New-Item -ItemType Directory -Path $target -Force | Out-Null
+            Copy-Item -Path (Join-Path $mod.ModuleBase '*') -Destination $target -Recurse -Force -ErrorAction Stop
+        }
+        $local = Get-Module -ListAvailable -Name PSAppDeployToolkit | Where-Object { $_.Version -eq $mod.Version -and (& $inCache $_) } | Select-Object -First 1
+        if ($local) { $mod = $local }
+    }
     $loaded = Get-Module -Name PSAppDeployToolkit
     if (-not $loaded -or $loaded.Version -ne $mod.Version)
     {
@@ -2308,16 +2324,20 @@ function Select-Entry($Entries, [string]$Hint)
 function Copy-Input($Cfg)
 {
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-    $items = @($Cfg.CopyItems | Where-Object { $_ })
-    if ($items.Count -eq 0) { Copy-Item -Path (Join-Path $srcDir '*') -Destination $workDir -Recurse -Force; return }
+    # Strings only: an empty list can arrive as {} from Windows PowerShell 5.1's ConvertTo-Json.
+    $items = @($Cfg.CopyItems | Where-Object { $_ -is [string] -and $_ })
+    if ($items.Count -eq 0) { Copy-Item -Path (Join-Path $srcDir '*') -Destination $workDir -Recurse -Force -ErrorAction Stop }
     foreach ($rel in $items)
     {
         $from = Join-Path $srcDir $rel
         $to   = Join-Path $workDir $rel
         $parent = Split-Path -Path $to -Parent
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        Copy-Item -LiteralPath $from -Destination $to -Recurse -Force
+        Copy-Item -LiteralPath $from -Destination $to -Recurse -Force -ErrorAction Stop
     }
+    $n = @(Get-ChildItem -LiteralPath $workDir -Recurse -Force -File -ErrorAction SilentlyContinue).Count
+    Write-ProbeLog "Copied the input to $workDir ($n files)"
+    if ($n -eq 0) { throw "Nothing could be copied from $srcDir (the folder shared from the packaging PC): the sandbox sees it as empty." }
 }
 
 function Invoke-InstallMode($Cfg)
@@ -2491,27 +2511,48 @@ finally
 function Get-WsbPath
 {
     # The Windows Sandbox CLI ships with the Store-serviced Windows Sandbox (Windows 11 24H2 and later) as an app
-    # execution alias, which is not always on PATH for the process that starts us.
+    # execution alias, which is not always on PATH for the process that starts us, and not always registered for
+    # every user; the copy in the app's own folder runs just as well. PSADT_PACKAGER_SANDBOX=Classic ignores it.
+    if ($env:PSADT_PACKAGER_SANDBOX -eq 'Classic') { return $null }
+    if ($script:WsbPath -and (Test-Path -LiteralPath $script:WsbPath)) { return $script:WsbPath }
+    $found = $null
     $cmd = Get-Command -Name 'wsb.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd) { return $cmd.Source }
-    $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wsb.exe'
-    if (Test-Path -LiteralPath $alias) { return $alias }
-    return $null
+    if ($cmd) { $found = $cmd.Source }
+    if (-not $found)
+    {
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wsb.exe'
+        if (Test-Path -LiteralPath $alias) { $found = $alias }
+    }
+    if (-not $found)
+    {
+        $pkg = $null
+        try { $pkg = Get-AppxPackage -Name 'MicrosoftWindows.WindowsSandbox' -ErrorAction Stop | Sort-Object Version -Descending | Select-Object -First 1 } catch { }
+        if ($pkg -and $pkg.InstallLocation)
+        {
+            $exe = Join-Path $pkg.InstallLocation 'wsb.exe'
+            if (Test-Path -LiteralPath $exe) { $found = $exe }
+        }
+    }
+    $script:WsbPath = $found
+    return $found
 }
 
 function Test-WindowsSandbox
 {
-    # Returns the path to wsb.exe, or $null with the reason in the log.
-    $wsb = Get-WsbPath
-    if ($wsb) { return $wsb }
+    # Returns how sandbox runs are driven - 'Cli' (wsb.exe) or 'Classic' (a .wsb file in a Sandbox window, for the
+    # built-in Windows Sandbox that has not been updated from the Microsoft Store) - or $null with the reason logged.
+    if (Get-WsbPath) { $script:SandboxMode = 'Cli'; return 'Cli' }
     if (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe'))
     {
-        Write-PackagerLog 'Windows Sandbox is installed but its command-line interface (wsb.exe) was not found. Update Windows Sandbox from the Microsoft Store, or use Windows 11 24H2 or later.' -Level Warn
+        if ($script:SandboxMode -ne 'Classic')
+        {
+            Write-PackagerLog 'This Windows Sandbox has no command-line tool (wsb.exe comes with the Microsoft Store update of Windows Sandbox), so each sandbox run opens a Windows Sandbox window. Leave it open: it runs on its own and closes itself when the run is done.'
+        }
+        $script:SandboxMode = 'Classic'
+        return 'Classic'
     }
-    else
-    {
-        Write-PackagerLog 'Windows Sandbox is not installed. Enable it in Windows Features (or Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM from Windows PowerShell 5.1 as admin) and reboot.' -Level Warn
-    }
+    $script:SandboxMode = $null
+    Write-PackagerLog 'Windows Sandbox is not installed. Enable it in Windows Features (or Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM from Windows PowerShell 5.1 as admin) and reboot.' -Level Warn
     return $null
 }
 
@@ -2638,6 +2679,118 @@ function Stop-PackagerSandbox
     }
 }
 
+$script:ClassicSandboxBootstrap = @'
+# Logon command of a classic Windows Sandbox run (runs as WDAGUtilityAccount, an administrator). Starts Run-Probe.ps1 as
+# SYSTEM through a scheduled task, as "wsb exec -r System" does, waits for it, records the outcome and shuts the sandbox
+# down, which closes its window.
+$done = 'C:\Probe\classic-done.txt'
+$outcome = ''
+try
+{
+    $ps       = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $action   = New-ScheduledTaskAction -Execute $ps -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Probe\Run-Probe.ps1'
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName 'PsadtPackagerProbe' -Action $action -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force -ErrorAction Stop | Out-Null
+    Start-ScheduledTask -TaskName 'PsadtPackagerProbe' -ErrorAction Stop
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-ScheduledTask -TaskName 'PsadtPackagerProbe').State -ne 'Running' -and -not (Test-Path -LiteralPath 'C:\Probe\probe.log') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+    while ((Get-ScheduledTask -TaskName 'PsadtPackagerProbe').State -eq 'Running') { Start-Sleep -Seconds 2 }
+    $outcome = 'exit ' + (Get-ScheduledTaskInfo -TaskName 'PsadtPackagerProbe').LastTaskResult
+}
+catch
+{
+    $outcome = 'error ' + $_.Exception.Message
+}
+finally
+{
+    [System.IO.File]::WriteAllText($done, $outcome)
+    & shutdown.exe /s /t 0 /f
+}
+'@
+
+function Invoke-ClassicSandboxRun
+{
+    # For a Windows Sandbox without wsb.exe (the built-in one on Windows 11 24H2 until it is updated from the Microsoft
+    # Store, which managed PCs often block): runs a .wsb file in a Sandbox window. Its logon command runs Run-Probe.ps1
+    # as SYSTEM and shuts the sandbox down when it is done. Only one sandbox can run at a time, so one already open stops us.
+    param
+    (
+        [Parameter(Mandatory)][string]$RunDir,
+        [Parameter(Mandatory)][object[]]$MappedFolders,
+        [int]$TimeoutSec = 1800,
+        [bool]$Network = $true,
+        [scriptblock]$OnTick
+    )
+    $names = @('WindowsSandbox', 'WindowsSandboxClient', 'WindowsSandboxRemoteSession')
+    if (Get-Process -Name $names -ErrorAction SilentlyContinue)
+    {
+        throw 'A Windows Sandbox window is already open. Only one sandbox can run at a time - close it and try again.'
+    }
+    $done = Join-Path $RunDir 'classic-done.txt'
+    if (Test-Path -LiteralPath $done) { Remove-Item -LiteralPath $done -Force }
+    Write-Utf8File -Path (Join-Path $RunDir 'Start-Classic.ps1') -Content $script:ClassicSandboxBootstrap
+    $esc = { param($t) [System.Security.SecurityElement]::Escape("$t") }
+    $xml = '<Configuration><Networking>' + $(if ($Network) { 'Default' } else { 'Disable' }) + '</Networking><MappedFolders>'
+    foreach ($m in $MappedFolders)
+    {
+        $xml += '<MappedFolder><HostFolder>' + (& $esc $m.Host) + '</HostFolder><SandboxFolder>' + (& $esc $m.Sandbox) + '</SandboxFolder><ReadOnly>' + $(if ($m.ReadOnly) { 'true' } else { 'false' }) + '</ReadOnly></MappedFolder>'
+    }
+    $xml += '</MappedFolders><LogonCommand><Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Probe\Start-Classic.ps1</Command></LogonCommand></Configuration>'
+    $wsbFile = Join-Path $RunDir 'PsadtPackager.wsb'
+    Write-Utf8File -Path $wsbFile -Content $xml
+    $logPath = Join-Path $RunDir 'probe.log'
+    $startLimit = 180   # seconds for the sandbox to boot, sign in and start the probe; normally 15-60
+
+    # Opening a sandbox right after another has closed sometimes fails ("Windows Sandbox failed to initialize"), and the
+    # error window stays open. So: if the probe has not started within $startLimit, close everything and try once more.
+    for ($try = 1; $try -le 2; $try++)
+    {
+        if ($try -eq 1) { Write-PackagerLog 'Opening a Windows Sandbox window for this run (it closes itself when the run is done).' }
+        else { Write-PackagerLog 'Windows Sandbox did not start the run; closing it and trying once more.' -Level Warn }
+        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsSandbox.exe') -ArgumentList ('"' + $wsbFile + '"') | Out-Null
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastCheck = 0
+        $seen = $false
+        $state = $null
+        $outcome = $null
+        while (-not $state)
+        {
+            for ($k = 0; $k -lt 4; $k++) { Start-Sleep -Milliseconds 250; Invoke-UiRefresh }
+            if ($OnTick) { & $OnTick }
+            $started = Test-Path -LiteralPath $logPath
+            if (Test-Path -LiteralPath $done) { $outcome = "$(Get-Content -LiteralPath $done -Raw -ErrorAction SilentlyContinue)".Trim(); $state = 'Done' }
+            elseif (-not $started -and $sw.Elapsed.TotalSeconds -ge $startLimit) { $state = 'NoStart' }
+            elseif ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $state = 'TimedOut' }
+            elseif ($sw.Elapsed.TotalSeconds - $lastCheck -ge 5)
+            {
+                # The window takes a moment to appear; once it has, its disappearance means the run was cut short.
+                $lastCheck = $sw.Elapsed.TotalSeconds
+                if (Get-Process -Name $names -ErrorAction SilentlyContinue) { $seen = $true }
+                elseif ($seen) { $state = $(if ($started) { 'Closed' } else { 'NoStart' }) }
+            }
+        }
+        if ($state -eq 'TimedOut') { Write-PackagerLog "The sandbox run did not finish within $([int]($TimeoutSec / 60)) minutes; closing it." -Level Warn }
+        if ($state -eq 'Closed') { Write-PackagerLog 'The Windows Sandbox window closed before the run finished.' -Level Warn }
+        if ($outcome -and $outcome -ne 'exit 0') { Write-PackagerLog "Sandbox logon command: $outcome" -Level Warn }
+
+        # After a finished run the sandbox shuts itself down; give it time, then close whatever is left.
+        $wait = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($state -eq 'Done' -and (Get-Process -Name $names -ErrorAction SilentlyContinue) -and $wait.Elapsed.TotalSeconds -lt 120) { Start-Sleep -Milliseconds 500; Invoke-UiRefresh }
+        $left = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
+        if ($left.Count -gt 0)
+        {
+            Write-PackagerLog 'Closing the Windows Sandbox window.'
+            $left | Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+        # Windows Sandbox needs a moment after its window has gone before it can start again.
+        $pause = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($pause.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 250; Invoke-UiRefresh }
+        if ($state -ne 'NoStart') { break }
+        if ($try -eq 2) { Write-PackagerLog 'Windows Sandbox failed to start twice. Close any Windows Sandbox windows (or restart the PC) and try again.' -Level Warn }
+    }
+}
+
 function Invoke-SandboxRun
 {
     # One sandbox, one Run-Probe.ps1 execution as SYSTEM. Streams probe.log into the packager log; returns result.json.
@@ -2655,22 +2808,29 @@ function Invoke-SandboxRun
     $logPath    = Join-Path $RunDir 'probe.log'
     $resultPath = Join-Path $RunDir 'result.json'
     foreach ($f in @($logPath, $resultPath)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
-
-    $id = Start-PackagerSandbox -Network $Network -MappedFolders @(
+    $mapped = @(
         @{ Host = $SourceRoot; Sandbox = 'C:\Source'; ReadOnly = $true },
         @{ Host = $RunDir;     Sandbox = 'C:\Probe';  ReadOnly = $false }
     )
+    $script:ProbeLogLines = 0
+    $tail = {
+        if (Test-Path -LiteralPath $logPath)
+        {
+            $lines = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue)
+            for ($n = $script:ProbeLogLines; $n -lt $lines.Count; $n++) { Write-PackagerLog "  sandbox> $($lines[$n])" }
+            $script:ProbeLogLines = $lines.Count
+        }
+    }
+    if ($script:SandboxMode -eq 'Classic' -or -not (Get-WsbPath))
+    {
+        Invoke-ClassicSandboxRun -RunDir $RunDir -MappedFolders $mapped -TimeoutSec $TimeoutSec -Network $Network -OnTick $tail
+        if (-not (Test-Path -LiteralPath $resultPath)) { return $null }
+        return ([System.IO.File]::ReadAllText($resultPath) | ConvertFrom-Json)
+    }
+
+    $id = Start-PackagerSandbox -Network $Network -MappedFolders $mapped
     try
     {
-        $script:ProbeLogLines = 0
-        $tail = {
-            if (Test-Path -LiteralPath $logPath)
-            {
-                $lines = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue)
-                for ($n = $script:ProbeLogLines; $n -lt $lines.Count; $n++) { Write-PackagerLog "  sandbox> $($lines[$n])" }
-                $script:ProbeLogLines = $lines.Count
-            }
-        }
         $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Probe\Run-Probe.ps1'
         $r = Invoke-Wsb -Arguments @('exec', '--id', $id, '-c', $cmd, '-r', 'System', '--raw') -TimeoutSec $TimeoutSec -OnTick $tail
         & $tail
@@ -2722,7 +2882,7 @@ function Invoke-SandboxProbe
         [bool]$Network = $true,
         [scriptblock]$OnAttempt              # called as (attempt number, total, candidate) before each sandbox run
     )
-    if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox (with its wsb command-line tool) is not available on this PC.' }
+    if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox is not available on this PC.' }
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw "Installer not found: $InstallerPath" }
     $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
     if (-not $SourceRoot) { $SourceRoot = Split-Path -Path $InstallerPath -Parent }
@@ -2743,7 +2903,9 @@ function Invoke-SandboxProbe
         $config = [ordered]@{
             Mode                  = 'Install'
             Label                 = $candidate
-            CopyItems             = $(if ($CopyWholeSource) { @() } else { @($rel) })
+            # Not $(if ... { @() }): Windows PowerShell 5.1 writes that empty result to JSON as {}, which the probe read
+            # as one blank item and copied the source folder itself instead of its contents.
+            CopyItems             = [string[]]@(@($rel) | Where-Object { -not $CopyWholeSource })
             FilePath              = $launch.FilePath
             Arguments             = $launch.Arguments
             WorkingDirectory      = $launch.WorkingDirectory
@@ -2806,7 +2968,7 @@ function Invoke-SandboxValidation
         [int]$TimeoutMinutes = 45,
         [bool]$Network = $true
     )
-    if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox (with its wsb command-line tool) is not available on this PC.' }
+    if (-not (Test-WindowsSandbox)) { throw 'Windows Sandbox is not available on this PC.' }
     $runDir = Join-Path $script:AppDataDir ('Sandbox\' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-validate')
     $config = [ordered]@{
         Mode             = 'Validate'
@@ -3617,7 +3779,7 @@ function Invoke-AutoPackage
     $probe = @(); $win = $null
     $sandbox = $false
     if (-not $NoSandbox) { $sandbox = [bool](Test-WindowsSandbox) }
-    if (-not $NoSandbox -and -not $sandbox) { $warnings.Add('Windows Sandbox (with wsb.exe) is not available, so nothing was run: switches, uninstall and detection are educated guesses.') }
+    if (-not $NoSandbox -and -not $sandbox) { $warnings.Add('Windows Sandbox is not available, so nothing was run: switches, uninstall and detection are educated guesses.') }
     if ($sandbox -and $in.Kind -in @('EXE', 'Script'))
     {
         if ($in.Kind -eq 'EXE')
@@ -6150,7 +6312,7 @@ $script:ui.BtnProbeSandbox.Add_Click({
     if (-not $installer) { Show-Message -Text "Could not find '$name' among the source files." -Icon Warning; return }
     if (-not (Test-WindowsSandbox))
     {
-        Show-Message -Text "Windows Sandbox (with its wsb command-line tool) is not available on this PC.`n`nEnable Windows Sandbox in Windows Features (Windows 11 24H2 or later, or update it from the Microsoft Store) and try again." -Title 'Find switches' -Icon Warning
+        Show-Message -Text "Windows Sandbox is not available on this PC.`n`nEnable Windows Sandbox in Windows Features, reboot and try again." -Title 'Find switches' -Icon Warning
         return
     }
 

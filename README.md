@@ -51,7 +51,7 @@ Headless rebuild from a saved definition (bulk re-packaging after a toolkit upda
 .\PsadtPackager.ps1 -Definition .\examples\GitHub-CLI.json -NoGui -Force
 ```
 
-The first build downloads PSAppDeployToolkit from the PowerShell Gallery into `%LOCALAPPDATA%\PsadtPackager\Modules` (or uses an installed copy). The toolkit shipped inside each package is the exact version that generated it.
+The first build downloads PSAppDeployToolkit from the PowerShell Gallery into `%LOCALAPPDATA%\PsadtPackager\Modules` (or uses an installed copy; one in a OneDrive-synced Documents folder is copied there once, because builds would otherwise wait for OneDrive to download it). The toolkit shipped inside each package is the exact version that generated it.
 
 ## Auto-package
 
@@ -118,7 +118,7 @@ Silent-switch presets are provided for Inno Setup, NSIS, InstallShield, WiX Burn
 ## Finding switches by running the installer
 
 Signature detection is a guess. *Find switches in Sandbox...* on the Install tab (and auto-package) proves it:
-for each candidate switch set it starts a fresh, headless Windows Sandbox (no window opens), copies the installer in
+for each candidate switch set it starts a fresh Windows Sandbox (headless where `wsb.exe` exists, see below), copies the installer in
 and runs it **as SYSTEM**, the account Intune uses. It runs `setup.exe /?` first and captures the help dialog's text
 or console output, then runs the candidate while watching the whole process tree. SYSTEM has no visible desktop,
 so an installer waiting for a click just sits there: a run counts as stuck when the tree (plus anything it started,
@@ -133,11 +133,18 @@ command, a registry detection rule, and vendor/version if the Application tab ha
 ordered: your current arguments, the detected engine's preset, generic switches whose strings appear in the binary,
 then the rest (four per run by default; each takes about a minute). Scripts are run once to see what they create.
 
-Nothing runs on the packaging PC. Requires Windows Sandbox with its command-line tool `wsb.exe`, which ships with
-Windows 11 24H2 and later (Pro/Enterprise/Education, virtualisation on). Enable it in *Windows Features*, or from an
-elevated **Windows PowerShell 5.1** prompt (the DISM cmdlets fail with "Class not registered" in the Store build of
-PowerShell 7): `Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM`, then reboot. Only
-one sandbox can run at a time. Run folders with `config.json`, `probe.log` and `result.json` live under
+Nothing runs on the packaging PC. Requires Windows Sandbox (Windows 10/11 Pro, Enterprise or Education, virtualisation
+on). Enable it in *Windows Features*, or from an elevated **Windows PowerShell 5.1** prompt (the DISM cmdlets fail with
+"Class not registered" in the Store build of PowerShell 7):
+`Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM`, then reboot.
+
+The best experience is the Microsoft Store version of Windows Sandbox (Windows 11 24H2 and later; it updates itself the
+first time you open Windows Sandbox from the Start menu while the Store is reachable). It has a command-line tool,
+`wsb.exe`, so runs are headless. Managed PCs often block that Store update and keep the built-in Sandbox, which has no
+command-line tool; there the packager runs each attempt in a **Windows Sandbox window** instead: it opens, signs in,
+runs the test as SYSTEM through a scheduled task and closes itself. Leave it open, closing it cancels the run. Set
+`PSADT_PACKAGER_SANDBOX=Classic` to use the window mode even where `wsb.exe` exists. Only one sandbox can run at a
+time. Run folders with `config.json`, `probe.log` and `result.json` live under
 `%LOCALAPPDATA%\PsadtPackager\Sandbox\`.
 
 ## Detection scripts
