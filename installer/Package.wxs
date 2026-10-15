@@ -40,7 +40,11 @@
           Description="Package any installer for Intune with PSAppDeployToolkit - drop it on the window"
           Target="[INSTALLFOLDER]PSADT Packager.exe"
           WorkingDirectory="INSTALLFOLDER"
-          Icon="PsadtPackager.ico" />
+          Icon="PsadtPackager.ico">
+          <!-- Same AppUserModelID the app sets on itself, so its taskbar button uses this shortcut's name and icon
+               (not powershell.exe's) and pinning it pins PSADT Packager. -->
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="YeomanLabs.PSADTPackager" />
+        </Shortcut>
         <RegistryValue Root="HKLM" Key="Software\YeomanLabs\PSADT Packager" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>

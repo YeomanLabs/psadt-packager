@@ -118,7 +118,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUN
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.1.0'
+$script:PackagerVersion = '1.1.1'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -128,7 +128,7 @@ $script:LogSink         = { param($Line, $Level) if ($Level -eq 'Error') { Write
 $script:InstallTypeCodes   = @('MSI', 'EXE', 'Script', 'MSIX', 'Custom')
 $script:InstallTypeLabels  = @('MSI (Start-ADTMsiProcess)', 'EXE / setup.exe (Start-ADTProcess)', 'Script in Files\ (.ps1, .cmd, .bat, .vbs)', 'MSIX / AppX (provisioned)', 'Custom PowerShell (you write the Install phase)')
 $script:UninstallTypeCodes = @('MSI', 'Name', 'EXE', 'Script', 'MSIX', 'Custom', 'None')
-$script:UninstallTypeLabels= @('MSI product code (Start-ADTMsiProcess)', 'Installed app by name (Uninstall-ADTApplication)', 'Uninstaller EXE on the device (Start-ADTProcess)', 'Script in Files\ (.ps1, .cmd, .bat, .vbs)', 'MSIX / AppX (remove provisioned + installed)', 'Custom PowerShell (you write the Uninstall phase)', 'None')
+$script:UninstallTypeLabels= @('MSI product code (Start-ADTMsiProcess)', 'Installed app by name (registered uninstaller)', 'Uninstaller EXE on the device (Start-ADTProcess)', 'Script in Files\ (.ps1, .cmd, .bat, .vbs)', 'MSIX / AppX (remove provisioned + installed)', 'Custom PowerShell (you write the Uninstall phase)', 'None')
 $script:DetectTypeCodes    = @('MSI', 'Registry', 'File', 'MSIX', 'Script')
 $script:DetectTypeLabels   = @('MSI product code in Uninstall registry', 'Uninstall registry entry by DisplayName', 'File exists (optionally version)', 'MSIX / AppX package', 'Custom script (paste your own)')
 $script:MatchModeCodes     = @('Exact', 'Wildcard', 'Regex')
@@ -143,7 +143,7 @@ $script:MinOsCodes         = @('v10_1607', 'v10_1703', 'v10_1709', 'v10_1803', '
 $script:MinOsLabels        = @('Windows 10 1607', 'Windows 10 1703', 'Windows 10 1709', 'Windows 10 1803', 'Windows 10 1809', 'Windows 10 1903', 'Windows 10 1909', 'Windows 10 2004', 'Windows 10 20H2', 'Windows 10 21H1 or later')
 $script:ArchChoicesIntune  = @('', 'x64', 'x86,x64', 'x86', 'arm64')
 # Tried in the sandbox, after the current arguments and the detected engine's preset. Order = most common first.
-$script:GenericSilentCandidates = @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-', '/quiet /norestart', '/silent', '/s', '/qn /norestart', '-silent', '--silent', '/q', '-q', '/s /v"/qn REBOOT=ReallySuppress"', '/exenoui /qn', '/passive /norestart', '-y', '--mode unattended')
+$script:GenericSilentCandidates = @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-', '/quiet /norestart', '/silent', '/silent /install','/s', '/qn /norestart', '-silent', '--silent', '/q', '-q', '/s /v"/qn REBOOT=ReallySuppress"', '/exenoui /qn', '/passive /norestart', '-y', '--mode unattended')
 # Tokens looked for as literal strings inside an EXE; a hit promotes the matching candidate.
 $script:SwitchVocabulary = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/SILENT', '/NORESTART', '/quiet', '/passive', '/norestart', '/qn', '/exenoui', '--silent', '-silent', '/silent', '--quiet', '--mode', 'unattended', '/unattended', '/S', '/s', '-q', '-y', '/q', '-i silent', '--confirm-command', '--accept-licenses', '-overwrite')
 $script:GraphToken         = $null
@@ -155,6 +155,7 @@ $script:SilentPresets = [ordered]@{
     'InstallShield'     = @{ Label = 'InstallShield';          Install = '/s /v"/qn REBOOT=ReallySuppress"';               Uninstall = '/s /x /v"/qn REBOOT=ReallySuppress"' }
     'WiX'               = @{ Label = 'WiX Burn bundle';        Install = '/quiet /norestart';                             Uninstall = '/uninstall /quiet /norestart' }
     'Squirrel'          = @{ Label = 'Squirrel (Electron)';    Install = '--silent';                                      Uninstall = '--uninstall -s' }
+    'Omaha'             = @{ Label = 'Omaha / Google Update (Chrome, Brave, Edge)'; Install = '/silent /install';          Uninstall = '--force-uninstall' }
     'InstallAware'      = @{ Label = 'InstallAware';           Install = '/s';                                            Uninstall = '/s MODIFY=FALSE REMOVE=TRUE UNINSTALL=YES' }
     'AdvancedInstaller' = @{ Label = 'Advanced Installer';     Install = '/exenoui /qn';                                  Uninstall = '/x /qn' }
     'MsiWrapper'        = @{ Label = 'msiexec-style wrapper';  Install = '/qn /norestart';                                Uninstall = '/qn /norestart' }
@@ -337,6 +338,7 @@ function New-PackageDefinition
             ApplicationType = 'All'
             File            = ''
             Arguments       = ''
+            SuccessExitCodes = @()   # empty = the Install tab's codes; some uninstallers report success as non-zero (Chromium: 19)
             PackageName     = ''
             PreScript       = ''
             CustomScript    = ''
@@ -519,13 +521,20 @@ function Get-InstallerEngine
         $len = [int][Math]::Min($fs.Length, 8MB)
         $buf = New-Object byte[] $len
         [void]$fs.Read($buf, 0, $len)
+        # The end of the file too: Omaha writes its tag into the signature block of even a 150 MB standalone installer.
+        $tailLen = [int][Math]::Min([Math]::Max(0, $fs.Length - $len), 256KB)
+        $tail = New-Object byte[] $tailLen
+        if ($tailLen -gt 0) { $fs.Position = $fs.Length - $tailLen; [void]$fs.Read($tail, 0, $tailLen) }
     }
     finally { $fs.Dispose() }
     $latin = [System.Text.Encoding]::GetEncoding(28591).GetString($buf)
     $wide  = $latin -replace "`0", ''
+    $end   = [System.Text.Encoding]::GetEncoding(28591).GetString($tail)
     $vi    = (Get-Item -LiteralPath $Path).VersionInfo
     $meta  = "$($vi.FileDescription) $($vi.ProductName) $($vi.Comments) $($vi.InternalName) $($vi.OriginalFilename)"
 
+    # Omaha (Google Update) metainstallers - Chrome, Brave, Edge - before anything else: they carry other engines' strings.
+    if ("$latin$end" -match 'Gact2\.0Omaha|appguid=\{' -or "$($vi.FileDescription)" -match '(?i)\bUpdate Setup$') { return 'Omaha' }
     if ($latin -match 'Inno Setup' -or $wide -match 'Inno Setup')                                   { return 'Inno' }
     if ($latin -match 'Squirrel' -or $wide -match 'Squirrel')                                       { return 'Squirrel' }
     if ($latin -match 'Nullsoft' -or $latin -match 'NSIS Error' -or $wide -match 'Nullsoft')        { return 'NSIS' }
@@ -1045,6 +1054,12 @@ function New-UninstallActionCode
     $u = $Def.Uninstall
     $i = $Def.Install
     $L = New-Object System.Collections.Generic.List[string]
+    # Extra exit codes that mean the uninstall worked (Chromium's setup.exe: 19) are ignored, not added as success codes:
+    # the toolkit exits with the last success code it saw, and Intune would report an uninstall that exits 19 as failed.
+    $successParam = ''
+    $known = @(@($i.SuccessExitCodes) + @($i.RebootExitCodes) | Where-Object { "$_" -match '^\s*-?\d+\s*$' } | ForEach-Object { [int]$_ })
+    $extraCodes = @($u.SuccessExitCodes | Where-Object { "$_" -match '^\s*-?\d+\s*$' } | ForEach-Object { [int]$_ } | Where-Object { $known -notcontains $_ } | Select-Object -Unique)
+    if ($extraCodes.Count -gt 0) { $successParam = ' -IgnoreExitCodes ' + (ConvertTo-IntArrayLiteral $extraCodes) }
     switch ($u.Type)
     {
         'MSI'
@@ -1061,21 +1076,46 @@ function New-UninstallActionCode
         }
         'Name'
         {
-            $line = '    Uninstall-ADTApplication'
-            if ($u.NameIsRegex) { $line += ' -NameMatch ' + (ConvertTo-PsSingleQuoted $u.Name.Trim()) }
+            # The toolkit's own default (Contains) would also remove every other app whose name merely contains this one.
+            $n = $u.Name.Trim()
+            $match = if ($u.NameIsRegex) { 'Regex' } elseif ($n -match '[\*\?]') { 'Wildcard' } else { 'Exact' }
+            $search = '-Name ' + (ConvertTo-PsSingleQuoted $n) + " -NameMatch $match"
+            if ($u.ApplicationType -eq 'EXE')
+            {
+                # Not Uninstall-ADTApplication: it runs the uninstaller from the uninstaller's own folder, and uninstallers
+                # that delete that folder (Chromium's setup.exe) then fail even though the app is gone.
+                $L.Add('    ## Runs the uninstall command the app registered (the quiet one if there is one), from the Windows folder.')
+                $L.Add("    `$apps = Get-ADTApplication $search -ApplicationType EXE")
+                $L.Add('    foreach ($app in $apps)')
+                $L.Add('    {')
+                $L.Add('        $sapParams = @{ FilePath = $app.UninstallStringFilePath; WorkingDirectory = $env:SystemRoot; WindowStyle = ''Hidden'' }')
+                if ("$($u.Arguments)".Trim())
+                {
+                    $L.Add('        if ($app.QuietUninstallStringFilePath) { $sapParams.FilePath = $app.QuietUninstallStringFilePath }')
+                    $L.Add('        $sapParams.ArgumentList = ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim()))
+                }
+                else
+                {
+                    $L.Add('        $argv = $app.UninstallStringArgumentList')
+                    $L.Add('        if ($app.QuietUninstallStringFilePath) { $sapParams.FilePath = $app.QuietUninstallStringFilePath; $argv = $app.QuietUninstallStringArgumentList }')
+                    $L.Add('        if ($argv) { $sapParams.ArgumentList = $argv }')
+                }
+                $L.Add('        Write-ADTLogEntry -Message "Uninstalling [$($app.DisplayName) $($app.DisplayVersion)]."')
+                $L.Add('        Start-ADTProcess @sapParams' + $successParam)
+                $L.Add('    }')
+                $L.Add('    if (-not $apps) { Write-ADTLogEntry -Message ''No installed application matches [' + ($n -replace "'", "''") + ']; nothing to remove.'' -Severity 2 }')
+            }
             else
             {
-                $n = $u.Name.Trim()
-                if ($n -match '[\*\?]') { $line += ' -FilterScript { $_.DisplayName -like ' + (ConvertTo-PsSingleQuoted $n) + ' }' }
-                else                    { $line += ' -Name ' + (ConvertTo-PsSingleQuoted $n) }
+                $line = "    Uninstall-ADTApplication $search"
+                if ($u.ApplicationType -and $u.ApplicationType -ne 'All') { $line += " -ApplicationType $($u.ApplicationType)" }
+                if ("$($u.Arguments)".Trim())
+                {
+                    $L.Add('    ## ArgumentList is used for EXE uninstallers (replaces the arguments in UninstallString); MSI entries get the toolkit defaults.')
+                    $line += ' -ArgumentList ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim())
+                }
+                $L.Add($line + $successParam)
             }
-            if ($u.ApplicationType -and $u.ApplicationType -ne 'All') { $line += " -ApplicationType $($u.ApplicationType)" }
-            if ("$($u.Arguments)".Trim())
-            {
-                $L.Add('    ## ArgumentList is used for EXE uninstallers (replaces the arguments in UninstallString); MSI entries get the toolkit defaults.')
-                $line += ' -ArgumentList ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim())
-            }
-            $L.Add($line)
         }
         'EXE'
         {
@@ -1085,7 +1125,7 @@ function New-UninstallActionCode
             $L.Add('    {')
             $line = '        Start-ADTProcess -FilePath $uninstaller'
             if ("$($u.Arguments)".Trim()) { $line += ' -ArgumentList ' + (ConvertTo-PsSingleQuoted $u.Arguments.Trim()) }
-            $line += ' -WindowStyle Hidden'
+            $line += ' -WindowStyle Hidden' + $successParam
             $L.Add($line)
             $L.Add('    }')
             $L.Add('    else')
@@ -2006,8 +2046,12 @@ function Invoke-Monitored
         {
             if ($dialogs.Count -gt 0 -and $idle -ge $UiGraceSec)
             {
+                # Say what the dialog says (an error, a licence, a question), not just its title; buttons left out.
                 $current = @($titles | Select-Object -Last 3) -join ' | '
-                $stuck = "waiting on a window ($current) with no activity for $([int]$idle)s"
+                $said = @(foreach ($h in $dialogs) { [ProbeWin]::ChildTexts([int64]$h) }) | Where-Object { $_ -and $_.Trim().Length -gt 3 -and $_.Trim() -notmatch '^(?i)&?(OK|Cancel|Close|Yes|No|Next\s*>?|Install|Retry|Finish|Browse\.*|I Agree|Accept)$|^<\s*&?Back$' } | Select-Object -Unique
+                $saidText = ((@($said) -join ' / ') -replace '\s+', ' ').Trim()
+                if ($saidText.Length -gt 220) { $saidText = $saidText.Substring(0, 217) + '...' }
+                $stuck = "waiting on a window ($current)$(if ($saidText) { ': "' + $saidText + '"' }) with no activity for $([int]$idle)s"
                 break
             }
             if ($idle -ge $IdleSec) { $stuck = "no activity for $([int]$idle)s"; break }
@@ -2153,8 +2197,25 @@ function Get-ExeInfo([string]$Path)
     try { $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo } catch { }
     $ver = ''
     if ($vi) { $ver = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart; if ($ver -eq '0.0.0.0') { $ver = "$($vi.FileVersion)".Trim() } }
+    $machine = ''
+    try
+    {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try
+        {
+            $br = New-Object System.IO.BinaryReader($fs)
+            if ($br.ReadUInt16() -eq 0x5A4D)
+            {
+                $fs.Position = 0x3C; $fs.Position = $br.ReadInt32()
+                if ($br.ReadUInt32() -eq 0x00004550) { $machine = switch ([int]$br.ReadUInt16()) { 0x8664 { 'x64' } 0x014C { 'x86' } 0xAA64 { 'ARM64' } default { '' } } }
+            }
+        }
+        finally { $fs.Dispose() }
+    }
+    catch { }
     return [ordered]@{
         Path            = $Path
+        Machine         = $machine
         FileVersion     = $ver
         ProductVersion  = $(if ($vi) { "$($vi.ProductVersion)".Trim() } else { '' })
         ProductName     = $(if ($vi) { "$($vi.ProductName)".Trim() } else { '' })
@@ -3115,10 +3176,14 @@ function Set-DefinitionFromProbe
     {
         if ($entry.Publisher -and ($Auto -or -not "$($Def.App.Vendor)".Trim()))     { $Def.App.Vendor  = "$($entry.Publisher)".Trim() }
         if ($entry.DisplayVersion -and ($Auto -or -not "$($Def.App.Version)".Trim())) { $Def.App.Version = Get-CleanVersion "$($entry.DisplayVersion)" }
-        if (-not "$($Def.App.Name)".Trim()) { $Def.App.Name = Get-CleanAppName -Name "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)" }
+        # What the installer registers names the app better than its own version resource (an Omaha stub calls
+        # itself "BraveSoftware Update"; the browser it installs registers as "Brave").
+        if ($Auto -or -not "$($Def.App.Name)".Trim()) { $Def.App.Name = Get-CleanAppName -Name "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)" }
         if (-not "$($Def.App.Arch)".Trim())
         {
-            if ($entry.Location -eq 'LocalMachine\Registry32') { $Def.App.Arch = 'x86' }
+            # The program's own PE header first: a 32-bit updater (Omaha) registers a 64-bit browser in the 32-bit view.
+            if ($mainExe -and $mainExe.PSObject.Properties['Machine'] -and "$($mainExe.Machine)") { $Def.App.Arch = "$($mainExe.Machine)" }
+            elseif ($entry.Location -eq 'LocalMachine\Registry32') { $Def.App.Arch = 'x86' }
             elseif ($entry.Location -eq 'LocalMachine\Registry64') { $Def.App.Arch = 'x64' }
         }
         $pattern = Get-VersionedNamePattern -DisplayName "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)"
@@ -3174,12 +3239,27 @@ function Set-DefinitionFromProbe
             $Def.Uninstall.ProductCode = $Matches[0]
             $Def.Uninstall.Arguments   = ''
         }
+        elseif ($entry)
+        {
+            # By name, with exactly the arguments proven in the sandbox: the package looks up the registered
+            # command at uninstall time (quiet one first, as the probe did), so it keeps working after the app has
+            # updated itself and moved its uninstaller (Chromium browsers keep it in a version-numbered folder).
+            $pattern = Get-VersionedNamePattern -DisplayName "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)"
+            $Def.Uninstall.Type            = 'Name'
+            $Def.Uninstall.Name            = $(if ($pattern) { $pattern } else { "$($entry.DisplayName)" })
+            $Def.Uninstall.NameIsRegex     = $false
+            $Def.Uninstall.ApplicationType = 'EXE'
+            $Def.Uninstall.Arguments       = "$($u.Arguments)"
+        }
         else
         {
             $Def.Uninstall.Type      = 'EXE'
             $Def.Uninstall.File      = ConvertTo-PortablePath "$($u.File)"
             $Def.Uninstall.Arguments = "$($u.Arguments)"
         }
+        # The uninstall was proven by its outcome (entry gone, detection negative); if the uninstaller reports that
+        # with a non-standard exit code (Chromium's setup.exe: 19 = uninstall successful), the package must accept it.
+        if ($null -ne $u.ExitCode -and @(0, 1641, 3010) -notcontains [int]$u.ExitCode) { $Def.Uninstall.SuccessExitCodes = @([int]$u.ExitCode) }
     }
     elseif ($entry)
     {
@@ -3385,7 +3465,7 @@ function Get-AutoDecisions
     if ($Win) { $entry = $Win.PrimaryEntry }
     $fromFile = switch ($PackageInput.Kind) { 'MSI' { 'MSI Property table' } 'MSIX' { 'package manifest' } 'Portable' { "version resource of $([System.IO.Path]::GetFileName($PackageInput.Entry))" } default { 'version resource of the installer' } }
 
-    & $add 'Name' $Def.App.Name $(if ($PackageInput.Kind -eq 'Script' -or -not $Info -or -not $Info.Name) { "Folder / file name ($($PackageInput.NameHint))" } else { "$fromFile, version and architecture stripped" })
+    & $add 'Name' $Def.App.Name $(if ($entry -and $Def.App.Name -eq (Get-CleanAppName -Name "$($entry.DisplayName)" -Version "$($entry.DisplayVersion)")) { 'DisplayName of the uninstall entry the installer created, version and architecture stripped' } elseif ($PackageInput.Kind -eq 'Script' -or -not $Info -or -not $Info.Name) { "Folder / file name ($($PackageInput.NameHint))" } else { "$fromFile, version and architecture stripped" })
     & $add 'Vendor' $Def.App.Vendor $(if ($entry -and $entry.Publisher -and $Def.App.Vendor -eq "$($entry.Publisher)".Trim()) { 'Publisher of the uninstall entry the installer created' } elseif ($Def.App.Vendor) { $fromFile } else { 'Not found - fill in' })
     & $add 'Version' $Def.App.Version $(if ($entry -and $entry.DisplayVersion -and $Def.App.Version -eq (Get-CleanVersion "$($entry.DisplayVersion)")) { 'DisplayVersion of the uninstall entry the installer created' } elseif ($PackageInput.Kind -ne 'Script' -and $Info -and $Info.Version -eq $Def.App.Version) { $fromFile } elseif ($Def.App.Version -and "$($PackageInput.NameHint)$([System.IO.Path]::GetFileName($PackageInput.Entry))" -match [regex]::Escape($Def.App.Version)) { "Folder / file name ($($PackageInput.NameHint))" } else { 'Not found - a default; check it' })
     & $add 'Architecture' $Def.App.Arch $(if ($Def.App.Arch) { 'MSI template, file name, PE header or registry view of the uninstall entry' } else { 'Unknown - the app is allowed on x86 and x64' })
@@ -3404,7 +3484,13 @@ function Get-AutoDecisions
     {
         'MSI'    { if ($Win -and $Win.Uninstall -and $Win.Uninstall.Verified) { 'MSI product code from the uninstall entry; uninstall proven in Sandbox' } else { 'MSI product code read from the MSI' } }
         'EXE'    { 'Uninstall command the installer registered; proven in Sandbox (entry removed, detection negative)' }
-        'Name'   { 'Uninstall-ADTApplication by the DisplayName the installer registered' + $(if ($Win -and $Win.Uninstall -and -not $Win.Uninstall.Verified) { ' (the registered command did not prove silent in Sandbox - check)' } else { '' }) }
+        'Name'
+        {
+            if (-not $entry) { 'Guessed from the product name - NOT proven (nothing was installed in Sandbox)' }
+            elseif ($Win.Uninstall -and $Win.Uninstall.Verified) { 'Runs the uninstall command the installer registered (looked up by its exact DisplayName at uninstall time), with the arguments proven in Sandbox; it keeps working after the app updates itself' }
+            elseif ($Win.Uninstall) { 'Registered uninstall command, by the DisplayName the installer registered (it did not prove silent in Sandbox - check)' }
+            else { 'Registered uninstall command, by the DisplayName the installer registered' }
+        }
         'Script' { 'Uninstall script shipped with the app' }
         'MSIX'   { 'Removes the provisioned and installed package' }
         'Custom' { if ($PackageInput.Kind -eq 'Portable') { 'Removes the copied folder and shortcut' } else { 'Generated from what the install created in Sandbox - review' } }
@@ -4339,6 +4425,16 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA')
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
+# Our own app identity, set before any window exists: without it the taskbar groups this window under
+# powershell.exe and shows PowerShell's icon. The MSI's Start menu shortcut carries the same ID, so the taskbar
+# button, pinning and Alt+Tab all show PSADT Packager.
+try
+{
+    Add-Type -Namespace PsadtPackager -Name Shell32 -MemberDefinition '[DllImport("shell32.dll")] public static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);'
+    [void][PsadtPackager.Shell32]::SetCurrentProcessExplicitAppUserModelID('YeomanLabs.PSADTPackager')
+}
+catch { }
+
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -4355,6 +4451,26 @@ $xaml = @'
     <SolidColorBrush x:Key="Line" Color="#E3E3E3"/>
     <SolidColorBrush x:Key="ControlLine" Color="#CFCFCF"/>
     <SolidColorBrush x:Key="Subtle" Color="#5F5F5F"/>
+
+    <!-- The app mark (same drawing as PsadtPackager.ico): window icon when the .ico is not next to the script. -->
+    <DrawingImage x:Key="AppIcon">
+      <DrawingImage.Drawing>
+        <DrawingGroup>
+          <GeometryDrawing Brush="{StaticResource Navy}">
+            <GeometryDrawing.Geometry>
+              <RectangleGeometry Rect="8,8,240,240" RadiusX="52" RadiusY="52"/>
+            </GeometryDrawing.Geometry>
+          </GeometryDrawing>
+          <GeometryDrawing Geometry="M 56 128 L 56 204 L 200 204 L 200 128 M 40 128 L 92 128 M 164 128 L 216 128">
+            <GeometryDrawing.Pen>
+              <Pen Brush="White" Thickness="18" StartLineCap="Round" EndLineCap="Round" LineJoin="Round"/>
+            </GeometryDrawing.Pen>
+          </GeometryDrawing>
+          <GeometryDrawing Brush="{StaticResource Coral}" Geometry="M 110 40 L 146 40 L 146 112 L 178 112 L 128 168 L 78 112 L 110 112 Z"/>
+          <GeometryDrawing Brush="Transparent" Geometry="M 0 0 L 256 256"/>
+        </DrawingGroup>
+      </DrawingImage.Drawing>
+    </DrawingImage>
 
     <Style TargetType="Label">
       <Setter Property="Margin" Value="0,2,8,2"/>
@@ -5031,7 +5147,12 @@ $xaml = @'
                 <TextBox Grid.Row="5" Grid.Column="1" Name="UninstallFile" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
                 <TextBlock Grid.Row="6" Grid.Column="1" Style="{StaticResource Hint}" Text="EXE method: full path on the device, $env:ProgramFiles etc. allowed. Script method: .ps1, .cmd, .bat or .vbs file name inside Files\."/>
                 <Label Grid.Row="7" Content="Arguments"/>
-                <TextBox Grid.Row="7" Grid.Column="1" Name="UninstallArgs" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                <DockPanel Grid.Row="7" Grid.Column="1">
+                  <TextBox DockPanel.Dock="Right" Name="UninstallSuccessCodes" Width="120" Margin="8,3,0,3" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                           ToolTip="Extra exit codes that mean the uninstall worked (Chromium-based browsers return 19). They are ignored, so the package still exits 0 for Intune."/>
+                  <Label DockPanel.Dock="Right" Content="Success exit codes" Margin="14,2,0,2"/>
+                  <TextBox Name="UninstallArgs" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+                </DockPanel>
                 <Label Grid.Row="8" Content="MSIX package name"/>
                 <TextBox Grid.Row="8" Grid.Column="1" Name="UninstallPackageName" FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
                 <Label Grid.Row="9" Content="Pre-uninstall PowerShell"/>
@@ -5235,6 +5356,22 @@ $script:Window = [System.Windows.Markup.XamlReader]::Parse($xaml)
 # The installer ships PsadtPackager.ico next to the script; use it for the window and taskbar when it is there.
 $windowIcon = Join-Path $PSScriptRoot 'PsadtPackager.ico'
 if (Test-Path -LiteralPath $windowIcon) { try { $script:Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]$windowIcon) } catch { } }
+if (-not $script:Window.Icon)
+{
+    # Run straight from the script (no .ico next to it): draw the same mark the installer's icon uses.
+    try
+    {
+        $iconSize = 64
+        $visual = New-Object System.Windows.Media.DrawingVisual
+        $dc = $visual.RenderOpen()
+        $dc.DrawImage($script:Window.FindResource('AppIcon'), (New-Object System.Windows.Rect(0, 0, $iconSize, $iconSize)))
+        $dc.Close()
+        $bitmap = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($iconSize, $iconSize, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $bitmap.Render($visual)
+        $script:Window.Icon = $bitmap
+    }
+    catch { }
+}
 $script:ui = @{}
 foreach ($m in [regex]::Matches($xaml, 'Name="(\w+)"')) { $script:ui[$m.Groups[1].Value] = $script:Window.FindName($m.Groups[1].Value) }
 $script:CurrentDefinitionPath = $null
@@ -5413,6 +5550,7 @@ function Get-UiDefinition
     $d.Uninstall.ApplicationType = Get-ComboCode $u.UninstallAppType $script:AppTypeCodes 'All'
     $d.Uninstall.File            = $u.UninstallFile.Text.Trim()
     $d.Uninstall.Arguments       = $u.UninstallArgs.Text.Trim()
+    $d.Uninstall.SuccessExitCodes = @(Split-ListText $u.UninstallSuccessCodes.Text | Where-Object { $_ -match '^-?\d+$' } | ForEach-Object { [int]$_ })
     $d.Uninstall.PackageName     = $u.UninstallPackageName.Text.Trim()
     $d.Uninstall.PreScript       = $u.UninstallPre.Text
     $d.Uninstall.CustomScript    = $u.UninstallCustom.Text
@@ -5494,6 +5632,7 @@ function Set-UiDefinition
     Set-ComboCode $u.UninstallAppType $script:AppTypeCodes $d.Uninstall.ApplicationType
     $u.UninstallFile.Text         = "$($d.Uninstall.File)"
     $u.UninstallArgs.Text         = "$($d.Uninstall.Arguments)"
+    $u.UninstallSuccessCodes.Text = (@($d.Uninstall.SuccessExitCodes) -join ', ')
     $u.UninstallPackageName.Text  = "$($d.Uninstall.PackageName)"
     $u.UninstallPre.Text          = "$($d.Uninstall.PreScript)"
     $u.UninstallCustom.Text       = "$($d.Uninstall.CustomScript)"

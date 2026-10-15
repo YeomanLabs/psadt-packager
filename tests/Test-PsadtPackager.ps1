@@ -142,7 +142,46 @@ $def = New-PackageDefinition; $def.Install.Type = 'EXE'; $def.App.Name = 'Contos
 [void](Set-DefinitionFromProbe -Def $def -Result $probe -Auto)
 Assert-Equal "$($def.Install.Arguments)|$($def.App.Vendor)|$($def.App.Version)|$($def.App.Arch)" '/VERYSILENT|Contoso Ltd|2.1.0|x64' 'probe: install args and registered metadata'
 Assert-Equal "$($def.Detection.Type)|$($def.Detection.MatchMode)|$($def.Detection.DisplayName)|$($def.Detection.MinVersion)" 'Registry|Wildcard|Contoso App (x64) - *|2.1.0' 'probe: version-tolerant registry detection'
-Assert-Equal "$($def.Uninstall.Type)|$($def.Uninstall.File)|$($def.Uninstall.Arguments)" 'EXE|$env:ProgramFiles\Contoso\unins000.exe|/VERYSILENT' 'probe: verified uninstall with a portable path'
+Assert-Equal "$($def.Uninstall.Type)|$($def.Uninstall.Name)|$($def.Uninstall.ApplicationType)|$($def.Uninstall.Arguments)" 'Name|Contoso App (x64) - *|EXE|/VERYSILENT' 'probe: verified uninstall runs by name with the proven arguments'
+Assert-Equal $def.App.Name 'Contoso App' 'probe: name comes from the registered DisplayName'
+$brave = [pscustomobject]@{ Id = 'LocalMachine\Registry32\BraveSoftware Brave-Browser'; KeyName = 'BraveSoftware Brave-Browser'; Location = 'LocalMachine\Registry32'; DisplayName = 'Brave'; DisplayVersion = '155.1.97.57'; Publisher = 'Brave Software Inc'; UninstallString = '"C:\Program Files\BraveSoftware\Brave-Browser\Application\155.1.97.57\Installer\setup.exe" --uninstall --system-level'; QuietUninstallString = ''; InstallLocation = ''; SystemComponent = 0 }
+$braveFp = [pscustomobject]@{ Folders = @([pscustomobject]@{ Path = 'C:\Program Files\BraveSoftware'; PerUser = $false; Exes = @([pscustomobject]@{ Path = 'C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe'; Machine = 'x64'; FileVersion = '155.1.97.57'; Size = 9 }) }); Shortcuts = @([pscustomobject]@{ Path = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Brave.lnk'; Target = 'C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe' }); RegistryKeys = @(); Services = @(); Tasks = @(); PerUser = @() }
+$braveProbe = [pscustomobject]@{ InstallSucceeded = $true; Candidate = '/silent /install'; PrimaryEntry = $brave; NewEntries = @($brave); Footprint = $braveFp; Uninstall = [pscustomobject]@{ Verified = $true; ExitCode = 19; File = 'C:\Program Files\BraveSoftware\Brave-Browser\Application\155.1.97.57\Installer\setup.exe'; Arguments = '--uninstall --system-level --force-uninstall' } }
+$bdef = New-PackageDefinition; $bdef.Install.Type = 'EXE'; $bdef.App.Name = 'BraveSoftware Update'
+[void](Set-DefinitionFromProbe -Def $bdef -Result $braveProbe -Auto)
+Assert-Equal "$($bdef.App.Name)|$($bdef.App.Arch)|$(@($bdef.Uninstall.SuccessExitCodes) -join ',')" 'Brave|x64|19' 'probe: Omaha app named from its entry, arch from brave.exe, exit 19 accepted'
+$bcode = (New-UninstallActionCode -Def $bdef) -join "`n"
+Assert-True ($bcode -match [regex]::Escape("Get-ADTApplication -Name 'Brave' -NameMatch Exact -ApplicationType EXE")) 'codegen: name uninstall matches the exact DisplayName, not every name containing it'
+Assert-True ($bcode -match [regex]::Escape('Start-ADTProcess @sapParams -IgnoreExitCodes @(19)')) 'codegen: the proven exit code is ignored, so the package itself exits 0 for Intune'
+# Run the generated block against stand-ins for the toolkit: the registered uninstaller, the proven arguments, a neutral working
+# directory (Chromium's setup.exe returns 20 when started from the version folder it deletes), every match, nothing when none.
+$script:calls = New-Object System.Collections.Generic.List[object]
+$script:fakeApps = @([pscustomobject]@{ DisplayName = 'Brave'; DisplayVersion = '155.1.97.57'; UninstallStringFilePath = 'C:\B\setup.exe'; UninstallStringArgumentList = @('--uninstall', '--system-level'); QuietUninstallStringFilePath = $null; QuietUninstallStringArgumentList = $null })
+function Get-ADTApplication { param($Name, $NameMatch, $ApplicationType) $script:calls.Add("get|$Name|$NameMatch|$ApplicationType"); $script:fakeApps }
+function Start-ADTProcess { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, $IgnoreExitCodes) $script:calls.Add("run|$FilePath|$($ArgumentList -join ' ')|$WorkingDirectory|$WindowStyle|$($IgnoreExitCodes -join ',')") }
+function Write-ADTLogEntry { param($Message, $Severity) $script:calls.Add("log|$Severity") }
+& ([scriptblock]::Create($bcode))
+Assert-Equal ($script:calls -join ' ; ') "get|Brave|Exact|EXE ; log| ; run|C:\B\setup.exe|--uninstall --system-level --force-uninstall|$env:SystemRoot|Hidden|19" 'codegen run: proven arguments, neutral working directory, exit 19 ignored'
+$script:calls.Clear(); $bdef.Uninstall.Arguments = ''
+$script:fakeApps += [pscustomobject]@{ DisplayName = 'Brave'; DisplayVersion = '1'; UninstallStringFilePath = 'C:\B\u.exe'; UninstallStringArgumentList = @('/x'); QuietUninstallStringFilePath = 'C:\B\q.exe'; QuietUninstallStringArgumentList = @('/quiet', '/norestart') }
+& ([scriptblock]::Create(((New-UninstallActionCode -Def $bdef) -join "`n")))
+Assert-Equal (@($script:calls | Where-Object { $_ -like 'run|*' }) -join ' ; ') "run|C:\B\setup.exe|--uninstall --system-level|$env:SystemRoot|Hidden|19 ; run|C:\B\q.exe|/quiet /norestart|$env:SystemRoot|Hidden|19" 'codegen run: no proven arguments uses the registered command, quiet one first, for every match'
+$script:calls.Clear(); $script:fakeApps = @()
+& ([scriptblock]::Create(((New-UninstallActionCode -Def $bdef) -join "`n")))
+Assert-Equal ($script:calls -join ' ; ') 'get|Brave|Exact|EXE ; log|2' 'codegen run: nothing installed logs a warning and runs nothing'
+Remove-Item Function:\Get-ADTApplication, Function:\Start-ADTProcess, Function:\Write-ADTLogEntry
+$ndef = New-PackageDefinition; $ndef.Uninstall.Type = 'Name'; $ndef.Uninstall.ApplicationType = 'All'
+$ndef.Uninstall.Name = 'Contoso App (x64) - *'
+Assert-True ((New-UninstallActionCode -Def $ndef) -join "`n" -match [regex]::Escape("Uninstall-ADTApplication -Name 'Contoso App (x64) - *' -NameMatch Wildcard")) 'codegen: wildcard name matches as a wildcard'
+$ndef.Uninstall.Name = '^Contoso App \d'; $ndef.Uninstall.NameIsRegex = $true
+Assert-True ((New-UninstallActionCode -Def $ndef) -join "`n" -match [regex]::Escape("Uninstall-ADTApplication -Name '^Contoso App \d' -NameMatch Regex")) 'codegen: regex name is passed as the name, matched as regex'
+$ndef.Uninstall.SuccessExitCodes = @(3010, 0)
+Assert-True (-not ((New-UninstallActionCode -Def $ndef) -join "`n" -match 'IgnoreExitCodes')) 'codegen: success and reboot codes are never ignored'
+
+$probeNoEntry =[pscustomobject]@{ InstallSucceeded = $true; Candidate = '/S'; PrimaryEntry = $null; NewEntries = @(); Footprint = $null; Uninstall = [pscustomobject]@{ Verified = $true; File = 'C:\Program Files (x86)\Tool\remove.exe'; Arguments = '/S' } }
+$def2 = New-PackageDefinition; $def2.Install.Type = 'EXE'
+[void](Set-DefinitionFromProbe -Def $def2 -Result $probeNoEntry -Auto)
+Assert-Equal "$($def2.Uninstall.Type)|$($def2.Uninstall.File)" 'EXE|${env:ProgramFiles(x86)}\Tool\remove.exe' 'probe: verified uninstall without an entry keeps the portable path'
 Assert-Equal (@($def.Install.ProcessesToClose) -join ',') 'ContosoApp' 'probe: main program becomes a process to close'
 
 $fp2 = [pscustomobject]@{ Folders = @([pscustomobject]@{ Path = 'C:\Program Files\Widget'; PerUser = $false; Exes = @([pscustomobject]@{ Path = 'C:\Program Files\Widget\widget.exe'; FileVersion = '10.0.1.0'; Size = 1 }) }); Shortcuts = @(); RegistryKeys = @('HKLM\SOFTWARE\Contoso\Widget'); Services = @([pscustomobject]@{ Name = 'WidgetSvc'; DisplayName = 'Widget'; PathName = 'x' }); Tasks = @('\Contoso\Widget Update'); PerUser = @() }
@@ -182,6 +221,8 @@ $uninstalls = @(
     @{ Type = 'MSI'; ProductCode = '{11111111-2222-3333-4444-555555555555}' },
     @{ Type = 'Name'; Name = 'App (x64) - *' },
     @{ Type = 'Name'; Name = 'App'; Arguments = '/S' },
+    @{ Type = 'Name'; Name = "O'Brien App"; ApplicationType = 'EXE'; Arguments = '--uninstall --force-uninstall'; SuccessExitCodes = @(19) },
+    @{ Type = 'Name'; Name = '^App \d'; NameIsRegex = $true; ApplicationType = 'EXE' },
     @{ Type = 'EXE'; File = '${env:ProgramFiles(x86)}\App\unins000.exe'; Arguments = '/VERYSILENT' },
     @{ Type = 'Script'; File = 'uninstall.cmd' },
     @{ Type = 'Script'; File = 'Uninstall.ps1' },

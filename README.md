@@ -70,7 +70,7 @@ Then, for installers and scripts:
 
 1. **Read the file**: name, vendor, version and architecture from the MSI, version resource or file/folder name (versions, `(x64)` and e-mail/URL vendors are cleaned up).
 2. **Run it in Windows Sandbox as SYSTEM**, like Intune does, one fresh sandbox per attempt. For an EXE it tries the engine's switches first, then switches found inside the binary, and stops at the first that installs silently. It records everything the install created: uninstall entries, folders, shortcuts, registry keys, services and scheduled tasks, and the help text the installer shows for `/?`.
-3. **Decide**: detection from the uninstall entry the installer registered (version-tolerant when the name carries the version), otherwise the main program file, a service or a registry key. Uninstall from the registered command (proven in the same sandbox), a shipped uninstall script, uninstall-by-name, or generated clean-up of what the install created. Publisher and version come from what was registered.
+3. **Decide**: detection from the uninstall entry the installer registered (version-tolerant when the name carries the version), otherwise the main program file, a service or a registry key. Uninstall looks the app up by its exact registered name at uninstall time and runs the uninstall command it registered (proven in the same sandbox), with the exact arguments that worked, so it keeps working after the app updates itself. It runs from the Windows folder rather than the uninstaller's own, because uninstallers that delete their own folder (Chromium's `setup.exe`) otherwise report failure. A non-standard exit code that meant success there (Chromium returns 19) is ignored, so the package itself exits 0 and Intune sees a successful uninstall. Without a registered uninstaller it uses a shipped uninstall script, or generated clean-up of what the install created. Publisher and version come from what was registered.
 4. **Build** the package and `.intunewin` (IntuneWinAppUtil.exe is downloaded if needed).
 5. **Test the package** in a fresh sandbox as SYSTEM: install, detection, uninstall, detection again. Anything left behind after the uninstall is listed.
 
@@ -93,7 +93,7 @@ Limits worth knowing:
 1. **Application**: *Auto-package...* does everything above. *Read metadata from installer* only reads the file (MSI, EXE, MSIX/AppX, PS1, CMD, BAT, VBS) and fills vendor, name, version, product code, silent switches, uninstall method and detection for you to finish by hand.
 2. **Source files**: add anything else the install needs (transforms, config, extra installers). Folders can be copied as a subfolder or flattened.
 3. **Install**: install type, arguments, transforms, processes to close, exit codes, dialogs, plus pre/post PowerShell that runs inside the toolkit session.
-4. **Uninstall**: MSI product code, installed app by name (`Uninstall-ADTApplication`), uninstaller EXE on the device, script, MSIX, custom or none.
+4. **Uninstall**: MSI product code, installed app by name, uninstaller EXE on the device, script, MSIX, custom or none. A name matches exactly unless it contains `*` (wildcard) or *Regex* is ticked: the toolkit's own default would also remove every app whose name merely contains it (`Brave` would take `Brave Beta` with it). With app type EXE the package runs the registered uninstall command itself (`Get-ADTApplication` + `Start-ADTProcess`, from the Windows folder); otherwise it uses `Uninstall-ADTApplication`.
 5. **Detection**: MSI product code, registry DisplayName (exact / wildcard / regex), file (optionally version), MSIX, or paste your own. *Run preview on this PC* executes the generated script locally.
 6. **Build**: destination, Intune deploy mode for the generated command lines, optional `.intunewin`.
 7. **Intune**: sign in and publish. Every field is derived from the tabs above; type over anything you want to change.
@@ -113,7 +113,7 @@ The generator only writes the `Variables` and `Functions` sections of `Invoke-Ap
 | MSIX / AppX | `Add-AppxProvisionedPackage -Online -PackagePath … -SkipLicense` |
 | Custom | your code becomes the Install phase |
 
-Silent-switch presets are provided for Inno Setup, NSIS, InstallShield, WiX Burn, Squirrel, InstallAware, Advanced Installer, install4j, InstallBuilder, InstallAnywhere, Qt IFW, Wise, Setup Factory and 7-Zip/WinRAR self-extractors; the engine is detected from the EXE where possible, and the log lists any known switches found as strings inside the binary.
+Silent-switch presets are provided for Inno Setup, NSIS, InstallShield, WiX Burn, Omaha / Google Update (Chrome, Brave, Edge: `/silent /install`), Squirrel, InstallAware, Advanced Installer, install4j, InstallBuilder, InstallAnywhere, Qt IFW, Wise, Setup Factory and 7-Zip/WinRAR self-extractors; the engine is detected from the EXE where possible, and the log lists any known switches found as strings inside the binary.
 
 ## Finding switches by running the installer
 
