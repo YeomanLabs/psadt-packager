@@ -118,7 +118,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not $env:PSADT_PACKAGER_RELAUN
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:PackagerVersion = '1.2.0'
+$script:PackagerVersion = '1.2.1'
 $script:AppDataDir      = Join-Path $env:LOCALAPPDATA 'PsadtPackager'
 $script:ModuleCache     = Join-Path $script:AppDataDir 'Modules'
 $script:SettingsPath    = Join-Path $script:AppDataDir 'settings.json'
@@ -4004,7 +4004,7 @@ function Invoke-AutoPackage
         $onAttempt = {
             param($Number, $Total, $Candidate)
             if ($in.Kind -eq 'Script') { & $progress 'Probing' "Running $entryLeaf as SYSTEM in Windows Sandbox to see what it creates..." $null }
-            else { & $progress 'Probing' "Sandbox attempt $Number of ${Total}: running $entryLeaf $Candidate as SYSTEM. Installers that contain MSIs pause about 2 minutes per MSI in the sandbox." $null }
+            else { & $progress 'Probing' "Sandbox attempt $Number of ${Total}: running $entryLeaf $Candidate as SYSTEM. The log below says every 30 seconds what it is doing and how many files it has written." $null }
         }
         $probe = @(Invoke-SandboxProbe -InstallerPath $in.Entry -SourceRoot $in.Root -CopyWholeSource:$in.IsFolder -Candidates $candidates -DetectionScript $detGuess -UninstallArgs $uArgs -AppNameHint $def.App.Name -SuccessCodes $success -HelpSwitch $help -OnAttempt $onAttempt)
         $win = @($probe | Where-Object { $_.InstallSucceeded }) | Select-Object -First 1
@@ -6528,7 +6528,7 @@ $script:ui.BtnProbeSandbox.Add_Click({
         $candidates = @(Get-SilentCandidates -Path $installer -Engine $engine -CurrentArgs $def.Install.Arguments -Max 4)
         $preset = $script:SilentPresets[$engine]
         if ($preset) { $uninstallArgs = $preset.Uninstall }
-        $msg = "Installer: $installer`nEngine: $engine`n`nEach candidate runs in a fresh Windows Sandbox as SYSTEM (like Intune; about 1-3 minutes each, no window opens): the installer with those switches, what it registers and creates, your detection script, and the uninstall.`n`nCandidates, in order:`n  " + ($candidates -join "`n  ") + "`n`nContinue?"
+        $msg = "Installer: $installer`nEngine: $engine`n`nEach candidate runs in a fresh Windows Sandbox as SYSTEM (like Intune; usually under a minute each, nothing to click): the installer with those switches, what it registers and creates, your detection script, and the uninstall.`n`nCandidates, in order:`n  " + ($candidates -join "`n  ") + "`n`nContinue?"
     }
     else
     {
