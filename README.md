@@ -122,8 +122,11 @@ for each candidate switch set it starts a fresh Windows Sandbox (headless where 
 and runs it **as SYSTEM**, the account Intune uses. It runs `setup.exe /?` first and captures the help dialog's text
 or console output, then runs the candidate while watching the whole process tree. SYSTEM has no visible desktop,
 so an installer waiting for a click just sits there: a run counts as stuck when the tree (plus anything it started,
-such as the Windows Installer service) goes idle for 30 seconds while it shows a window with controls (quiet-mode
-windows that are created but never shown don't count), or stays idle for five minutes without one. It snapshots
+such as the Windows Installer service) goes idle for 30 seconds while it shows a window with controls, or stays idle
+for five minutes without one. Windows that don't wait for anyone don't count: quiet-mode windows that are created but
+never shown, and progress windows (a visible progress bar, as `/passive` installs and redistributables chained by a
+bundle show). While Windows Installer is running, a window gets 150 seconds instead of 30, because every MSI install
+sits still for about two minutes in the sandbox. The report quotes only the text the window actually shows. It snapshots
 the system before and after, so a successful run reports the real uninstall entry (`DisplayName`,
 `DisplayVersion`, `Publisher`, `UninstallString`/`QuietUninstallString`) and everything else the install created,
 runs your detection script, then runs the uninstall and confirms the entry is gone and detection is negative.
