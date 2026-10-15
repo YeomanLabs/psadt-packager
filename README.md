@@ -141,9 +141,11 @@ on). Enable it in *Windows Features*, or from an elevated **Windows PowerShell 5
 The best experience is the Microsoft Store version of Windows Sandbox (Windows 11 24H2 and later; it updates itself the
 first time you open Windows Sandbox from the Start menu while the Store is reachable). It has a command-line tool,
 `wsb.exe`, so runs are headless. Managed PCs often block that Store update and keep the built-in Sandbox, which has no
-command-line tool; there the packager runs each attempt in a **Windows Sandbox window** instead: it opens, signs in,
-runs the test as SYSTEM through a scheduled task and closes itself. Leave it open, closing it cancels the run. Set
-`PSADT_PACKAGER_SANDBOX=Classic` to use the window mode even where `wsb.exe` exists. Only one sandbox can run at a
+command-line tool; there the packager starts Windows Sandbox from a `.wsb` file instead and **hides its window** as
+soon as it appears: the sandbox signs in, runs the test as SYSTEM through a scheduled task and shuts itself down. If a
+run does not start within three minutes (Windows Sandbox sometimes fails to start right after another has closed), it
+is closed and retried once with the window shown, so any error is visible. Set `PSADT_PACKAGER_SANDBOX_WINDOW=Show` to
+always see the window, or `PSADT_PACKAGER_SANDBOX=Classic` to use this mode even where `wsb.exe` exists. Only one sandbox can run at a
 time. Run folders with `config.json`, `probe.log` and `result.json` live under
 `%LOCALAPPDATA%\PsadtPackager\Sandbox\`.
 
